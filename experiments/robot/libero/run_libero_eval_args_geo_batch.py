@@ -12,9 +12,8 @@ Usage:
         --task_suite_name [ libero_spatial | libero_object | libero_goal | libero_10 | libero_90 ] \
         --center_crop [ True | False ] \
         --run_id_note <OPTIONAL TAG TO INSERT INTO RUN ID FOR LOGGING> \
-        --use_wandb [ True | False ] \
-        --wandb_project <PROJECT> \
-        --wandb_entity <ENTITY>
+        --use_swanlab [ True | False ] \
+        --swanlab_project <PROJECT>
 """
 
 import os
@@ -28,7 +27,6 @@ import numpy as np
 import tqdm
 from libero.libero import benchmark
 
-import wandb
 import sys
 sys.path.append("PATH TO/white_patch")
 from appply_random_transform import RandomPatchTransform
@@ -56,6 +54,7 @@ from experiments.robot.robot_utils import (
     normalize_gripper_action,
     set_seed_everywhere,
 )
+from experiments.robot.swanlab_utils import maybe_init_swanlab, maybe_log_swanlab
 
 
 # @dataclass
@@ -85,9 +84,8 @@ from experiments.robot.robot_utils import (
 #     run_id_note: Optional[str] = "spatial1"                # Extra note to add in run ID for logging
 #     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
 #
-#     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
-#     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
-#     wandb_entity: str = "YOUR_WANDB_ENTITY"          # Name of entity to log under
+#     use_swanlab: bool = False                        # Whether to also log results in SwanLab
+#     swanlab_project: str = "VLA-Attack"              # Name of SwanLab project to log to
 #
 #     seed: int = 7                                    # Random Seed (for reproducibility)
 #
@@ -135,13 +133,12 @@ def eval_libero(cfg) -> None:
     log_file = open(local_log_filepath, "w")
     print(f"Logging to local log file: {local_log_filepath}")
     print(f"Log Path:{str(os.path.join(cfg.local_log_dir, cfg.task_suite_name, '.txt'))}")
-    # Initialize Weights & Biases logging as well
-    if cfg.use_wandb:
-        wandb.init(
-            entity=cfg.wandb_entity,
-            project=cfg.wandb_project,
-            name=run_id,
-        )
+    swanlab_enabled = maybe_init_swanlab(
+        cfg.use_swanlab,
+        cfg.swanlab_project,
+        run_id,
+        vars(cfg),
+    )
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -272,27 +269,25 @@ def eval_libero(cfg) -> None:
         log_file.write(f"Current task success rate: {float(task_successes) / float(task_episodes)}\n")
         log_file.write(f"Current total success rate: {float(total_successes) / float(total_episodes)}\n")
         log_file.flush()
-        if cfg.use_wandb:
-            wandb.log(
-                {
-                    f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
-                    f"num_episodes/{task_description}": task_episodes,
-                }
-            )
+        maybe_log_swanlab(
+            swanlab_enabled,
+            {
+                f"success_rate/{task_description}": float(task_successes) / float(task_episodes),
+                f"num_episodes/{task_description}": task_episodes,
+            },
+        )
 
     # Save local log file
     log_file.close()
 
 
-    # Push total metrics and local log file to wandb
-    if cfg.use_wandb:
-        wandb.log(
-            {
-                "success_rate/total": float(total_successes) / float(total_episodes),
-                "num_episodes/total": total_episodes,
-            }
-        )
-        wandb.save(local_log_filepath)
+    maybe_log_swanlab(
+        swanlab_enabled,
+        {
+            "success_rate/total": float(total_successes) / float(total_episodes),
+            "num_episodes/total": total_episodes,
+        },
+    )
     # 追加模式打开文件并添加新内容
     with open(os.path.join(cfg.local_log_dir,cfg.task_suite_name+".txt"), "a") as file:
         file.write(f"success_rate/total:{float(total_successes) / float(total_episodes)}, num_episodes/total:{total_episodes} position_info:{cfg.angle}_{cfg.shx}_{cfg.shy}_{cfg.x}_{cfg.y} \n")  # 在新行添加内容
@@ -325,9 +320,8 @@ def parse_args():
     #################################################################################################################
     parser.add_argument("--run_id_note", type=str, default=f"test_libero_object", help="Extra note to add in run ID for logging")
     parser.add_argument("--local_log_dir", type=str, default="./experiments/logs", help="Local directory for eval logs")
-    parser.add_argument("--use_wandb", type=bool, default=True, help="Whether to also log results in Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="LIBERO_simulation_test", help="Name of W&B project to log to (use default!)")
-    parser.add_argument("--wandb_entity", type=str, default="taowen_wang-rit", help="Name of entity to log under")
+    parser.add_argument("--use_swanlab", type=bool, default=True, help="Whether to also log results in SwanLab")
+    parser.add_argument("--swanlab_project", type=str, default="VLA-Attack", help="Name of SwanLab project to log to")
     parser.add_argument("--seed", type=int, default=7, help="Random Seed (for reproducibility)")
     parser.add_argument("--patchroot", type=str, default="/spl_data/tw9146/openvla-main/run/white_patch_attack/a5083c2b-1186-4464-ab9f-1056211a2221/4000/patch.pt", help="")
     parser.add_argument("--x", type=int, default=2, help="")
