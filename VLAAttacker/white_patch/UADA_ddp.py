@@ -3,7 +3,7 @@ import torchvision
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from transformers.modeling_outputs import CausalLMOutputWithPast
-import wandb
+import swanlab
 import torch.nn.functional as F
 from white_patch.appply_random_transform import RandomPatchTransform
 from white_patch.openvla_dataloader import get_dataset
@@ -34,7 +34,7 @@ def denormalize(images,mean,std):
 
 
 class OpenVLAAttacker(object):
-    def __init__(self, vla_path, dataset_name, save_dir="", resize_patch=False,patch_size=[3,50,50],lr=0.01,bs=1,warmup=20,num_iter=10000,maskidx=[],innerLoop=1,geometry=True,use_wandb=True, MSE_weights=1):
+    def __init__(self, vla_path, dataset_name, save_dir="", resize_patch=False,patch_size=[3,50,50],lr=0.01,bs=1,warmup=20,num_iter=10000,maskidx=[],innerLoop=1,geometry=True,use_swanlab=True, MSE_weights=1):
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
@@ -66,7 +66,7 @@ class OpenVLAAttacker(object):
         self.maskidx = maskidx
         self.innerLoop = innerLoop
         self.geometry = geometry
-        self.use_wandb = use_wandb
+        self.use_swanlab = use_swanlab
         self.patch_size = patch_size
         self.val_CE_loss = []
         self.val_MSE_Distance = []
@@ -227,8 +227,8 @@ class OpenVLAAttacker(object):
                                  "TRAIN_UAD": gobal_UAD}
                 pbar.update(1)
                 if rank == 0:
-                    if self.use_wandb:
-                        wandb.log(train_logdata, step=i)
+                    if self.use_swanlab:
+                        swanlab.log(train_logdata, step=i)
 
                 if i % 200 == 0:
                     avg_CE_loss = torch.tensor(0, dtype=torch.float32)
@@ -298,9 +298,9 @@ class OpenVLAAttacker(object):
                                         pil_img = torchvision.transforms.ToPILImage()(modified_images[o, :, :, :])
                                         pil_img.save(os.path.join(val_related_file_path, f"{str(o)}.png"))
                                         pil_imgs.append(pil_img)
-                                    if self.use_wandb != "false":
-                                        wandb.log(log_data, step=i)
-                                        wandb.log({"AdvImg": [wandb.Image(pil_img) for pil_img in pil_imgs]})
+                                    if self.use_swanlab != "false":
+                                        swanlab.log(log_data, step=i)
+                                        swanlab.log({"AdvImg": [swanlab.Image(pil_img) for pil_img in pil_imgs]})
                                 temp_save_dir = os.path.join(self.save_dir, "last")
                                 os.makedirs(temp_save_dir, exist_ok=True)
                                 torch.save(model.module.patch.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
@@ -315,8 +315,8 @@ class OpenVLAAttacker(object):
                                 #         pil_img = torchvision.transforms.ToPILImage()(modified_images[o, :, :, :])
                                 #         pil_img.save(os.path.join(val_related_file_path, f"{str(o)}.png"))
                                 #         pil_imgs.append(pil_img)
-                                #     if self.use_wandb != "false":
-                                #         wandb.log({"Last_Step_AdvImg": [wandb.Image(pil_img) for pil_img in pil_imgs]})
+                                #     if self.use_swanlab != "false":
+                                #         swanlab.log({"Last_Step_AdvImg": [swanlab.Image(pil_img) for pil_img in pil_imgs]})
                             if rank==0:
                                 self.val_CE_loss.append(gobal_avg_CE_loss)
                                 self.val_MSE_Distance.append(gobal_avg_MSE_Distance)
@@ -325,13 +325,13 @@ class OpenVLAAttacker(object):
         self.cleanup()
 
     @classmethod
-    def run(cls, vla_path,dataset_name, save_dir, resize_patch, patch_size,lr,bs,warmup,num_iter,maskidx,innerLoop,geometry,use_wandb, MSE_weights):
+    def run(cls, vla_path,dataset_name, save_dir, resize_patch, patch_size,lr,bs,warmup,num_iter,maskidx,innerLoop,geometry,use_swanlab, MSE_weights):
         world_size = torch.cuda.device_count()
         instance_params = {
             "vla_path": vla_path, "dataset_name":dataset_name, "save_dir": save_dir, "resize_patch": resize_patch, "patch_size": patch_size,
             "lr": lr, "bs": bs, "warmup": warmup,
             "num_iter": num_iter, "maskidx": maskidx, "innerLoop": innerLoop, "geometry": geometry,
-            "use_wandb": use_wandb, "MSE_weights": MSE_weights
+            "use_swanlab": use_swanlab, "MSE_weights": MSE_weights
         }
         mp.spawn(OpenVLAAttacker._attack_entry, args=(instance_params, world_size), nprocs=world_size)
 

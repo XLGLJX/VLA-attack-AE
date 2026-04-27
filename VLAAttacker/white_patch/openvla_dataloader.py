@@ -18,7 +18,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def get_bridge_dataloader(batch_size,server):
     vla_path: str = "openvla/openvla-7b"
-    data_root_dir = Path(f"{server}/openvla-main/dataset")
+    data_root_dir = Path(f"{server}/dataset")
     dataset_name = "bridge_orig"
     shuffle_buffer_size = 100_000
     image_aug = False
@@ -28,7 +28,8 @@ def get_bridge_dataloader(batch_size,server):
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Load OpenVLA Processor and Model using HF AutoClasses
-    processor = AutoProcessor.from_pretrained(vla_path, trust_remote_code=True)
+    config = OpenVLAConfig.from_pretrained(vla_path, trust_remote_code=True, local_files_only=True)
+    processor = PrismaticProcessor.from_pretrained(vla_path, trust_remote_code=True, local_files_only=True)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -80,24 +81,25 @@ def get_bridge_dataloader(batch_size,server):
 
 def get_dataloader(batch_size,server,dataset,vla_path):
     # vla_path: str = "openvla/openvla-7b"
-    data_root_dir = Path(f"{server}/openvla-main/dataset")
+    data_root_dir = Path(f"{server}/dataset")
     # dataset_name = "bridge_orig"
-    if dataset == "bridge_orig":
-        vla_path = "openvla/openvla-7b"
-    elif dataset == "libero_spatial":
-        vla_path = "openvla/openvla-7b-finetuned-libero-spatial"
-        dataset += "_no_noops"
-    elif dataset == "libero_object":
-        vla_path = "openvla/openvla-7b-finetuned-libero-object"
-        dataset += "_no_noops"
-    elif dataset == "libero_goal":
-        vla_path = "openvla/openvla-7b-finetuned-libero-goal"
-        dataset += "_no_noops"
-    elif dataset == "libero_10":
-        vla_path = "openvla/openvla-7b-finetuned-libero-10"
-        dataset += "_no_noops"
-    else:
-        assert False, "Invalid dataset"
+    if vla_path is None:
+        if dataset == "bridge_orig":
+            vla_path = "openvla/openvla-7b"
+        elif dataset == "libero_spatial":
+            vla_path = "openvla/openvla-7b-finetuned-libero-spatial"
+            dataset += "_no_noops"
+        elif dataset == "libero_object":
+            vla_path = "openvla/openvla-7b-finetuned-libero-object"
+            dataset += "_no_noops"
+        elif dataset == "libero_goal":
+            vla_path = "openvla/openvla-7b-finetuned-libero-goal"
+            dataset += "_no_noops"
+        elif dataset == "libero_10":
+            vla_path = "openvla/openvla-7b-finetuned-libero-10"
+            dataset += "_no_noops"
+        else:
+            assert False, "Invalid dataset"
     shuffle_buffer_size = 100_000
     image_aug = False
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -106,7 +108,8 @@ def get_dataloader(batch_size,server,dataset,vla_path):
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Load OpenVLA Processor and Model using HF AutoClasses
-    processor = AutoProcessor.from_pretrained(vla_path, trust_remote_code=True)
+    config = OpenVLAConfig.from_pretrained(vla_path, trust_remote_code=True, local_files_only=True)
+    processor = PrismaticProcessor.from_pretrained(vla_path, trust_remote_code=True, local_files_only=True)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)

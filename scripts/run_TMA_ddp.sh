@@ -1,7 +1,7 @@
 #!/bin/bash
 current_dir=$(pwd)
 echo $current_dir
-CUDA_VISIBLE_DEVICES=1,2 python VLAAttacker/TMA_wrapper.py \
+torchrun --nproc_per_node=2 --master_port=29501 VLAAttacker/TMA_wrapper_ddp.py \
     --maskidx 0 \
     --lr 2e-3 \
     --server $current_dir \

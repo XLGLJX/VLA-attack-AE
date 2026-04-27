@@ -13,6 +13,14 @@ from tqdm import tqdm
 import os
 import transformers
 import pickle
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
+from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+from prismatic.extern.hf.processing_prismatic import PrismaticProcessor
+from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+from openvla_dataloader import get_dataloader
 IGNORE_INDEX = -100
 
 def normalize(images,mean,std):
@@ -26,10 +34,44 @@ def denormalize(images,mean,std):
     return images
 
 class OpenVLAAttacker(object):
-    def __init__(self, vla, processor, save_dir="",optimizer="pgd",resize_patch=False):
+    def __init__(self, vla_path, dataset_name, save_dir="", optimizer="adamW", resize_patch=False,
+                 patch_size=[3,50,50], lr=0.01, bs=1, warmup=20, num_iter=2000,
+                 maskidx=[], innerLoop=50, geometry=True, use_swanlab=True,
+                 target_action=0, accumulate_steps=1, server=""):
+        # Register OpenVLA
+        AutoConfig.register("openvla", OpenVLAConfig)
+        AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+        # Load processor and model
+        self.processor = AutoProcessor.from_pretrained(vla_path, trust_remote_code=True, local_files_only=True)
+        vla = AutoModelForVision2Seq.from_pretrained(
+            vla_path,
+            torch_dtype=torch.bfloat16,
+            quantization_config=None,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        vla.gradient_checkpointing_enable()
         self.vla = vla.eval()
         self.vla.vision_backbone_requires_grad = True
-        self.processor = processor
+
+        # Store parameters
+        self.dataset_name = dataset_name
+        self.patch_size = patch_size
+        self.lr = lr
+        self.bs = bs
+        self.warmup = warmup
+        self.num_iter = num_iter
+        self.maskidx = maskidx
+        self.innerLoop = innerLoop
+        self.geometry = geometry
+        self.use_swanlab = use_swanlab
+        self.target_action = target_action
+        self.accumulate_steps = accumulate_steps
+        self.server = server
+
         self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
         self.prompt_builder = PurePromptBuilder("openvla")
         self.image_transform = self.processor.image_processor.apply_transform
@@ -42,8 +84,7 @@ class OpenVLAAttacker(object):
         self.adv_action_L1_loss = []
         self.min_val_avg_CE_loss = 1000000
         self.min_val_avg_L1_loss = 1000000
-        # Get device from model (handle DataParallel)
-        self.device = next(self.vla.parameters()).device if hasattr(self.vla, 'parameters') else torch.device('cuda:0')
+        self.device = torch.device('cuda')
         self.randomPatchTransform = RandomPatchTransform(self.device, resize_patch)
         self.mean = [torch.tensor([0.484375, 0.455078125, 0.40625]), torch.tensor([0.5, 0.5, 0.5])]
         self.std = [torch.tensor([0.228515625, 0.2236328125, 0.224609375]), torch.tensor([0.5, 0.5, 0.5])]
@@ -81,9 +122,7 @@ class OpenVLAAttacker(object):
         plt.clf()
         torch.save(self.loss_buffer, '%s/loss' % (self.save_dir))
 
-    def patchattack_unconstrained(self,train_dataloader, val_dataloader, num_iter=5000, target_action=np.zeros(7),
-                                  patch_size=[3,50,50], alpha=1/255, accumulate_steps=1, maskidx=[], warmup=20, 
-                                  filterGripTrainTo1=False, geometry=False, colorjitter=False,innerLoop=1,args=None):
+    def patchattack_unconstrained(self,train_dataloader,val_dataloader,num_iter=5000,target_action=np.zeros(7),patch_size=[3,50,50],alpha=1/255, accumulate_steps=1,maskidx=[],warmup=20,filterGripTrainTo1=False,geometry=False, colorjitter=False,innerLoop=1,args=None):
         self.val_CE_loss = []
         self.val_L1_loss = []
         self.val_ASR = []
@@ -134,7 +173,6 @@ class OpenVLAAttacker(object):
             inner_avg_loss = 0
             inner_relatived_distance = 0
             for inner_loop in range(innerLoop):
-                # 贴上patch
                 if not geometry and not colorjitter:
                     modified_images = self.randomPatchTransform.paste_patch_fix(pixel_values, patch, mean=self.mean,
                                                                                 std=self.std)
@@ -151,11 +189,7 @@ class OpenVLAAttacker(object):
                 )
                 loss = output.loss / accumulate_steps
                 inner_avg_loss += loss.item()
-                # 解码预测动作
-                # 跳过图像的patch token
-                # why [:, num_patches:-1]? 
-                # logits [num_patch], 这个位置对应的 logits，正好是“最后一个 patch 位置用来预测 patch 后第一个原始 token”的输出，因此切片要从 num_patches 开始。
-                # -1 是去掉最后一个没法和下一个 label 对齐的位置
+
                 action_logits = output.logits[:,self.vla.vision_backbone.featurizer.patch_embed.num_patches: -1]
                 action_preds = action_logits.argmax(dim=2)
                 temp_label = newlabels[:, 1:].clone()
@@ -488,3 +522,45 @@ class OpenVLAAttacker(object):
             temp_relative_distance = distance_to_anchor / max_boundary_distance
             relative_distance += temp_relative_distance
         return relative_distance/pred.shape[0]
+    def setup_ddp(self, rank, world_size):
+        """Setup DDP for distributed training"""
+        torch.cuda.set_device(rank)
+        self.vla = self.vla.to(rank)
+        self.vla = DDP(self.vla, device_ids=[rank], find_unused_parameters=True)
+        self.device = torch.device(f'cuda:{rank}')
+
+    def attack_ddp(self, rank, world_size):
+        """Main attack method with DDP support"""
+        self.setup_ddp(rank, world_size)
+        
+        # Load data with distributed sampler
+        train_dataloader, val_dataloader = get_dataloader(
+            batch_size=self.bs,
+            server=self.server,
+            dataset=self.dataset_name,
+            vla_path=self.server + "/models/" + self.dataset_name.split('_')[0]
+        )
+        
+        # Run attack
+        target_action_array = self.target_action * np.ones(7)
+        self.patchattack_unconstrained(
+            train_dataloader, val_dataloader,
+            num_iter=self.num_iter,
+            target_action=target_action_array,
+            patch_size=self.patch_size,
+            alpha=self.lr,
+            accumulate_steps=self.accumulate_steps,
+            maskidx=self.maskidx,
+            warmup=self.warmup,
+            geometry=self.geometry,
+            innerLoop=self.innerLoop
+        )
+
+    @staticmethod
+    def _attack_entry(rank, instance_params, world_size):
+        """Static entry point for DDP"""
+        if not dist.is_initialized():
+            dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        
+        instance = OpenVLAAttacker(**instance_params)
+        instance.attack_ddp(rank, world_size)

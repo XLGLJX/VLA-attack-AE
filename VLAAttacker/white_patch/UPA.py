@@ -6,7 +6,7 @@ import numpy as np
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import seaborn as sns
 import matplotlib.pyplot as plt
-import wandb
+import swanlab
 import random
 import torch.nn.functional as F
 from appply_random_transform import RandomPatchTransform
@@ -174,8 +174,8 @@ class OpenVLAAttacker(object):
                 print(f"loss: {loss.item()}, ")
             else:
                 print(f"target_loss: {loss.item()}")
-            if args.wandb_project != "false":
-                wandb.log(
+            if args.swanlab_project != "false":
+                swanlab.log(
                     {
                         "TRAIN_attack_loss(CE)": loss.item(),
                         "TRAIN_patch_gradient": log_patch_grad,
@@ -240,8 +240,8 @@ class OpenVLAAttacker(object):
                     log_data["reverse_direction_loss"] = avg_reserve_loss
                     log_data["avg_angle_loss"] = avg_angle_loss
                     log_data["avg_distance_loss"] = avg_distance_loss
-                    if args.wandb_project != "false":
-                        wandb.log(log_data,step=i)
+                    if args.swanlab_project != "false":
+                        swanlab.log(log_data,step=i)
                     if avg_reserve_loss.item() < self.reverse_direction_loss:
                         self.reverse_direction_loss = avg_reserve_loss.item()
                         temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
@@ -256,8 +256,8 @@ class OpenVLAAttacker(object):
                             pil_img = torchvision.transforms.ToPILImage()(modified_images[o, :, :, :])
                             pil_img.save(os.path.join(val_related_file_path, f"{str(o)}.png"))
                             pil_imgs.append(pil_img)
-                        if args.wandb_project != "false":
-                            wandb.log({"AdvImg": [wandb.Image(pil_img) for pil_img in pil_imgs]})
+                        if args.swanlab_project != "false":
+                            swanlab.log({"AdvImg": [swanlab.Image(pil_img) for pil_img in pil_imgs]})
                     temp_save_dir = os.path.join(self.save_dir, "last")
                     os.makedirs(temp_save_dir, exist_ok=True)
                     torch.save(patch.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
@@ -341,6 +341,7 @@ class OpenVLAAttacker(object):
                 relative_distance[f"{str(maskidx[idx2])}"].append(temp_relative_distance.item())
         return relative_distance
 
+    # 只攻击指定动作维
     def mask_labels(self,labels,maskidx):
         mask = labels > self.action_tokenizer.action_token_begin_idx
         masked_labels = labels[mask]
@@ -355,15 +356,16 @@ class OpenVLAAttacker(object):
             newlabels.append(temp_label.unsqueeze(0))
         return torch.cat(newlabels, dim=0)
 
+    # 构造一个“人为改写后的引导目标”
     def change_target(self,gt):
-        mask= gt!=-100
+        mask = gt!=-100
         random_assign = torch.randint(0, 2, gt[mask & (gt == 31872)].shape, dtype=torch.bool).to(gt.device)
         gt[mask & (gt == 31872)] = torch.where(random_assign, torch.tensor(31744, dtype=gt.dtype,device=gt.device),torch.tensor(31999, dtype=gt.dtype,device=gt.device))
         gt[mask & (gt>31872)] = 31744
         gt[mask & (gt<31872)] = 31999
         return gt
 
-
+    # UPA 最核心的反方向优化目标
     def weighted_loss(self, logits, labels):
         temp_label = labels[:,1:].to(labels.device) # (bs,seq_len)
         action_mask = temp_label!= -100

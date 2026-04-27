@@ -39,8 +39,8 @@ class RandomPatchTransform:
             [shy, 1, 0],
             [0, 0, 1]
         ], dtype=np.float32)
-        
-   def simulation_random_patch(self, image, patch, geometry=False,colorjitter=False,angle=1,shx=0.1,shy=0.1,position=(0,0)):
+
+    def simulation_random_patch(self, image, patch, geometry=False,colorjitter=False,angle=1,shx=0.1,shy=0.1,position=(0,0)):
         """
         random paste patch to images
 
@@ -110,13 +110,14 @@ class RandomPatchTransform:
 
             canvas = torch.ones(img_channels, img_height, img_width).to(self.device) * -100
 
+            patch_channels, patch_height, patch_width = patch.shape
+
             if self.resize_patch:
                 scale = random.uniform(0.61, 1.39) #~ 1%~5%
                 height, width = int(patch_height * scale), int(patch_width * scale)  # random scale patch
                 patch = transforms.Resize((height, width))(patch)
 
-            patch_channels, patch_height, patch_width = patch.shape
-
+            
             max_x = img_width - patch_width
             max_y = img_height - patch_height
 

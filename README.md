@@ -104,9 +104,9 @@ bash scripts/run_TMA.sh
 bash scripts/run_UADA.sh
 ```
 
-(b2) DDP ver For UADA
+(b2) DDP ver For UADA (2 GPUs)
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 --master_port=29501 VLAAttacker/UADA_wrapper3_ddp.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --master_port=29501 VLAAttacker/UADA_wrapper_ddp.py \
     --maskidx 0 \
     --lr 1e-3 \
     --iter 2000 \
@@ -164,4 +164,3 @@ If you find this project useful, please consider citing our paper:
     year      = {2025},
     pages     = {6948--6958}
 }
-

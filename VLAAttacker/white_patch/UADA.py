@@ -6,7 +6,7 @@ import numpy as np
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import seaborn as sns
 import matplotlib.pyplot as plt
-import wandb
+import swanlab
 import random
 import torch.nn.functional as F
 from white_patch.appply_random_transform import RandomPatchTransform
@@ -143,6 +143,8 @@ class OpenVLAAttacker(object):
                     labels=labels,
                 )
                 celoss = output.loss
+                
+                # =============== calculate loss ===============
                 MSE_Distance, UAD = self.weighted_loss(output.logits, labels,maskidx)
                 MSE_Distance = MSE_Distance + 1/celoss
                 MSE_Distance.backward()
@@ -157,7 +159,7 @@ class OpenVLAAttacker(object):
                 optimizer.zero_grad()
                 self.vla.zero_grad()
                 torch.cuda.empty_cache()
-
+                # =============================================
 
             if self.optimizer == "adamW":
                 if (i + 1) % accumulate_steps == 0 or (i + 1) == len(train_dataloader):
@@ -184,8 +186,8 @@ class OpenVLAAttacker(object):
             for key, value in train_relative_distance.items():
                 property_name = f"train_rd_{key}"
                 train_logdata[property_name] = sum(value) / len(value)
-            if args.wandb_project != "false":
-                wandb.log(train_logdata,step=i)
+            if args.swanlab_project != "false":
+                swanlab.log(train_logdata, step=i)
 
             if i % 100 == 0:
                 self.plot_loss()
@@ -252,8 +254,8 @@ class OpenVLAAttacker(object):
                     for key, value in relative_distance.items():
                         property_name = f"val_rd_{key}"
                         log_data[property_name] = sum(value) / len(value)
-                    if args.wandb_project != "false":
-                        wandb.log(log_data,step=i)
+                    if args.swanlab_project != "false":
+                        swanlab.log(log_data,step=i)
                     if avg_MSE_Distance < self.MSE_Distance_best:
                         self.MSE_Distance_best = avg_MSE_Distance
                         temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
@@ -268,8 +270,8 @@ class OpenVLAAttacker(object):
                             pil_img = torchvision.transforms.ToPILImage()(modified_images[o, :, :, :])
                             pil_img.save(os.path.join(val_related_file_path, f"{str(o)}.png"))
                             pil_imgs.append(pil_img)
-                        if args.wandb_project != "false":
-                            wandb.log({"AdvImg": [wandb.Image(pil_img) for pil_img in pil_imgs]})
+                        if args.swanlab_project != "false":
+                            swanlab.log({"AdvImg": [swanlab.Image(pil_img) for pil_img in pil_imgs]})
                     temp_save_dir = os.path.join(self.save_dir, "last")
                     os.makedirs(temp_save_dir, exist_ok=True)
                     torch.save(patch.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
@@ -283,8 +285,8 @@ class OpenVLAAttacker(object):
                         pil_img = torchvision.transforms.ToPILImage()(modified_images[o, :, :, :])
                         pil_img.save(os.path.join(val_related_file_path, f"{str(o)}.png"))
                         pil_imgs.append(pil_img)
-                    if args.wandb_project != "false":
-                        wandb.log({"Last_Step_AdvImg": [wandb.Image(pil_img) for pil_img in pil_imgs]})
+                    if args.swanlab_project != "false":
+                        swanlab.log({"Last_Step_AdvImg": [swanlab.Image(pil_img) for pil_img in pil_imgs]})
                 self.val_CE_loss.append(avg_CE_loss)
                 self.val_MSE_Distance.append(avg_MSE_Distance)
                 self.val_UAD.append(avg_UAD)
@@ -369,6 +371,7 @@ class OpenVLAAttacker(object):
         return relative_distance
 
     def mask_labels(self,labels,maskidx):
+        # 把原始 labels 改造成“只有 maskidx 指定的动作维参与监督，其余动作维全部忽略”的标签。
         mask = labels > self.action_tokenizer.action_token_begin_idx
         masked_labels = labels[mask]
         masked_labels = masked_labels.view(masked_labels.shape[0] // 7, 7)
@@ -406,6 +409,7 @@ class OpenVLAAttacker(object):
         return distance_loss, UAD
 
     def cal_UAD(self,pred,gt):
+        # 计算归一化后的动作偏离指标
         continuous_actions_gt = torch.tensor(
             self.action_tokenizer.decode_token_ids_to_actions(gt.clone().detach().cpu().numpy())
         )

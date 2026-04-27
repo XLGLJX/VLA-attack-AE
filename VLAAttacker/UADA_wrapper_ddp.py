@@ -1,7 +1,7 @@
 import torch
 import os
 import numpy as np
-import wandb
+import swanlab
 import argparse
 import random
 import uuid
@@ -39,15 +39,15 @@ def main(args):
     pwd = os.getcwd()
     exp_id = str(get_exp_id())
     if  "bridge_orig" in args.dataset:
-        vla_path = "openvla/openvla-7b"
+        vla_path = f"{pwd}/models/openvla-7b"
     elif "libero_spatial" in args.dataset:
-        vla_path = "openvla/openvla-7b-finetuned-libero-spatial"
+        vla_path = f"{pwd}/models/openvla-7b-finetuned-libero-spatial"
     elif "libero_object" in args.dataset:
-        vla_path = "openvla/openvla-7b-finetuned-libero-object"
+        vla_path = f"{pwd}/models/openvla-7b-finetuned-libero-object"
     elif "libero_goal" in args.dataset:
-        vla_path = "openvla/openvla-7b-finetuned-libero-goal"
+        vla_path = f"{pwd}/models/openvla-7b-finetuned-libero-goal"
     elif "libero_10" in args.dataset:
-        vla_path = "openvla/openvla-7b-finetuned-libero-10"
+        vla_path = f"{pwd}/models/openvla-7b-finetuned-libero-10"
     else:
         assert False, "Invalid dataset"
     set_seed(42)
@@ -56,16 +56,18 @@ def main(args):
     for i in args.maskidx:
         target += str(i)
     name = f"{args.dataset}_modifyLabel_MSEDistance_lr{format(args.lr, '.0e')}_iter{args.iter}_warmup{args.warmup}_target{target}_inner_loop{args.innerLoop}_patch_size{args.patch_size}_seed42-{exp_id}"
-    if args.wandb_project != "false" and rank == 0:
-        wandb_run = wandb.init(entity=args.wandb_entity, project=args.wandb_project,name=name, tags=args.tags)
-        wandb.config = {"iteration":args.iter, "learning_rate": args.lr, "attack_target": args.maskidx,"accumulate_steps":args.accumulate}
+    if args.swanlab_project != "false" and rank == 0:
+        swanlab.init(project=args.swanlab_project, experiment_name=name, config={
+            "iteration": args.iter, "learning_rate": args.lr,
+            "attack_target": args.maskidx, "accumulate_steps": args.accumulate
+        })
     print(f"exp_id:{exp_id}")
     path = f"{pwd}/run/UADA/{exp_id}"
 
     os.makedirs(path, exist_ok=True)
 
     # train_dataset, val_dataset = get_dataset(dataset=args.dataset)
-    # OpenVLAAttacker.run(vla_path,dataset_name=args.dataset, save_dir=path, resize_patch=args.resize_patch,patch_size=args.patch_size,lr=args.lr,bs=args.bs,warmup=args.warmup,num_iter=args.iter,maskidx=args.maskidx,innerLoop=args.innerLoop,geometry=args.geometry, use_wandb=True,MSE_weights=args.MSE_weights)
+    # OpenVLAAttacker.run(vla_path,dataset_name=args.dataset, save_dir=path, resize_patch=args.resize_patch,patch_size=args.patch_size,lr=args.lr,bs=args.bs,warmup=args.warmup,num_iter=args.iter,maskidx=args.maskidx,innerLoop=args.innerLoop,geometry=args.geometry, use_swanlab=True,MSE_weights=args.MSE_weights)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     instance_params = {
@@ -73,7 +75,7 @@ def main(args):
         "patch_size": args.patch_size,
         "lr": args.lr, "bs": args.bs, "warmup": args.warmup,
         "num_iter": args.iter, "maskidx": args.maskidx, "innerLoop": args.innerLoop, "geometry": args.geometry,
-        "use_wandb": True, "MSE_weights": args.MSE_weights
+        "use_swanlab": True, "MSE_weights": args.MSE_weights
     }
     OpenVLAAttacker._attack_entry(rank, instance_params, world_size)
     # patch 224x224
@@ -97,8 +99,7 @@ def arg_parser():
     parser.add_argument('--geometry', type=str2bool, nargs='?',default=True,
                         help='add geometry trans to path')
     parser.add_argument('--patch_size', default='3,50,50', type=list_of_ints)
-    parser.add_argument('--wandb_project', default="xxx", type=str)
-    parser.add_argument('--wandb_entity', default="xxx", type=str)
+    parser.add_argument('--swanlab_project', default="VLA-Attack", type=str)
     parser.add_argument('--innerLoop', default=50, type=int)
     parser.add_argument('--dataset', default="bridge_orig", type=str)
     parser.add_argument('--resize_patch', type=str2bool, default=False)
