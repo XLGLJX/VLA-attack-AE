@@ -147,6 +147,13 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+/dataset
+/models/
+/run/
+/experiments/logs/
+/.codex
+/AI_log/
+/LIBERO/
 
 # Rollout videos and wandb logs
 rollouts/
