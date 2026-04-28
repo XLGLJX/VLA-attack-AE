@@ -30,7 +30,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import draccus
 import numpy as np
@@ -47,6 +47,7 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     save_rollout_video,
 )
+from experiments.robot.libero import libero_swanlab
 from experiments.robot.openvla_utils import get_processor
 from experiments.robot.robot_utils import (
     DATE,
@@ -91,7 +92,7 @@ def eef_trajectory_to_line3d(trajectory: list, episode_idx: int, done: bool):
 
     line3d = ec.Line3D()
     line3d.add(
-        f"Episode {episode_idx} | {status}",
+        "",
         data,
         encode={"x": 1, "y": 0, "z": 2},
         xaxis3d_opts=pyopts.Axis3DOpts(name="Y (Front/Back)", type_="value"),
@@ -116,7 +117,43 @@ def eef_trajectory_to_line3d(trajectory: list, episode_idx: int, done: bool):
     )
     # 加粗线宽
     opts = line3d.get_options()
-    opts["series"][0]["lineStyle"] = {"width": 6}
+    opts["series"][0]["lineStyle"] = {"width": 12}
+    return line3d
+
+
+def create_multi_episode_line3d() -> Any:
+    """创建一个空的 Line3D 对象，用于后续追加多条轨迹系列，并开启图例。"""
+    ec = swanlab.echarts
+    line3d = ec.Line3D()
+    line3d.set_global_opts(
+        legend_opts=pyopts.LegendOpts(is_show=True),
+        title_opts=pyopts.TitleOpts(title="Multi-Episode Trajectories"),
+    )
+    return line3d
+
+
+def add_episode_to_line3d(
+    line3d: Any, trajectory: list, episode_idx: int, done: bool
+) -> Any:
+    """向已有的 Line3D 中追加一条新轨迹 series，成功为绿色，失败为红色。"""
+    data = [[float(p[1]), float(p[0]), float(p[2])] for p in trajectory]
+    status = "success" if done else "fail"
+    color = "#32CD32" if done else "#DC143C"
+
+    line3d.add(
+        f"Episode {episode_idx} | {status}",
+        data,
+        encode={"x": 1, "y": 0, "z": 2},
+        xaxis3d_opts=pyopts.Axis3DOpts(name="Y (Front/Back)", type_="value"),
+        yaxis3d_opts=pyopts.Axis3DOpts(name="X (Left/Right)", type_="value"),
+        zaxis3d_opts=pyopts.Axis3DOpts(name="Z (Up/Down)", type_="value"),
+        grid3d_opts=pyopts.Grid3DOpts(width=100, height=100, depth=100),
+        label_opts={"is_show": False},
+    )
+
+    # 手动注入 lineStyle 颜色到刚添加的 series
+    opts = line3d.get_options()
+    opts["series"][-1]["lineStyle"] = {"color": color, "width": 12}
     return line3d
 
 
@@ -226,6 +263,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        multi_line3d = None  # 用于汇总当前 task 所有 episode 轨迹
         for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
             print(f"\nTask: {task_description}")
             log_file.write(f"\nTask: {task_description}\n")
@@ -325,28 +363,36 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 os.makedirs(gif_dir, exist_ok=True)
                 gif_path = f"{gif_dir}/{DATE_TIME}--episode={total_episodes}--success={done}--task={processed_task}.gif"
                 imageio.mimsave(gif_path, replay_images, fps=10)
-                maybe_log_swanlab(
+                libero_swanlab.log_rollout_video(
                     swanlab_enabled,
-                    {
-                        f"rollout_video/{task_description}": swanlab.Video(
-                            gif_path, caption=f"Episode {episode_idx} | Success={done}"
-                        ),
-                    },
+                    task_description,
+                    gif_path,
+                    episode_idx,
+                    done,
                     step=total_episodes,
                 )
 
             # Upload EEF trajectory to SwanLab (Line3D)
             if swanlab_enabled and len(eef_trajectory) > 0:
-                traj_line3d = eef_trajectory_to_line3d(eef_trajectory, episode_idx, done)
-                traj = np.stack(eef_trajectory, axis=0)
-                path_length = float(np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1)))
-                maybe_log_swanlab(
+                libero_swanlab.log_episode_trajectory(
                     swanlab_enabled,
-                    {
-                        f"eef_trajectory/{task_description}": traj_line3d,
-                        f"eef_path_length/{task_description}": path_length,
-                    },
+                    task_description,
+                    eef_trajectory,
+                    episode_idx,
+                    done,
                     step=total_episodes,
+                )
+
+            # Upload multi-episode trajectory to SwanLab (Line3D with legend)
+            if swanlab_enabled and len(eef_trajectory) > 0:
+                multi_line3d = libero_swanlab.update_multi_episode_trajectory(
+                    swanlab_enabled,
+                    task_description,
+                    multi_line3d,
+                    eef_trajectory,
+                    episode_idx,
+                    done,
+                    step=episode_idx,
                 )
 
             # Log current results
@@ -375,74 +421,14 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
         # 每完成一个 task，立即上传当前累积的柱状图与数据表（step=task_id，支持渐进增长）
         if swanlab_enabled and task_results:
-            ec = swanlab.echarts
-
-            bar = ec.Bar()
-            x_labels = [f"Task {r['task_id']}\n(n={r['num_episodes']})" for r in task_results]
-            bar.add_xaxis(x_labels)
-            bar.add_yaxis("Success Rate", [round(r["success_rate"], 4) for r in task_results])
-
-            table = ec.Table()
-            headers = ["Task ID", "Task Description", "Success Rate", "Num Episodes"]
-            rows = [
-                [str(r["task_id"]), r["task_description"], f"{r['success_rate']:.4f}", str(r["num_episodes"])]
-                for r in task_results
-            ]
-            table.add(headers, rows)
-
-            maybe_log_swanlab(
-                swanlab_enabled,
-                {
-                    "task_success_rate_bar": bar,
-                    "task_results_table": table,
-                },
-                step=task_id,
-            )
+            libero_swanlab.log_task_results(swanlab_enabled, task_results, step=task_id)
 
     # Save local log file
     log_file.close()
 
     # 汇总仪表盘与饼图展示总成功率
     if swanlab_enabled and total_episodes > 0:
-        ec = swanlab.echarts
-        total_success_rate = float(total_successes) / float(total_episodes)
-        total_failures = total_episodes - total_successes
-
-        gauge = ec.Gauge()
-        gauge.add(
-            "Total Success Rate",
-            [("Success Rate", round(total_success_rate * 100, 2))],
-            detail_label_opts={"formatter": "{value}%"},
-        )
-
-        pie = ec.Pie()
-        pie.add(
-            "Episode Distribution",
-            [
-                ("Success", total_successes),
-                ("Failure", total_failures),
-            ],
-        )
-
-        summary_table = ec.Table()
-        summary_table.add(
-            ["Metric", "Value"],
-            [
-                ["Total Episodes", str(total_episodes)],
-                ["Successes", str(total_successes)],
-                ["Failures", str(total_failures)],
-                ["Success Rate", f"{total_success_rate:.4f}"],
-            ],
-        )
-
-        maybe_log_swanlab(
-            swanlab_enabled,
-            {
-                "total_success_rate_gauge": gauge,
-                "episode_distribution_pie": pie,
-                "total_summary_table": summary_table,
-            },
-        )
+        libero_swanlab.log_final_summary(swanlab_enabled, total_episodes, total_successes)
 
 
 if __name__ == "__main__":
