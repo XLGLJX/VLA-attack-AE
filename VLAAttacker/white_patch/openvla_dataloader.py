@@ -16,7 +16,7 @@ import random
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def get_bridge_dataloader(batch_size,server):
+def get_bridge_dataloader(batch_size,server, world_size=None, rank=None):
     vla_path: str = "openvla/openvla-7b"
     data_root_dir = Path(f"{server}/dataset")
     dataset_name = "bridge_orig"
@@ -57,6 +57,10 @@ def get_bridge_dataloader(batch_size,server):
         image_aug=image_aug,
     )
 
+    if world_size is not None and rank is not None and hasattr(vla_dataset_train, "shard"):
+        vla_dataset_train = vla_dataset_train.shard(num_shards=world_size, index=rank)
+        vla_dataset_val = vla_dataset_val.shard(num_shards=world_size, index=rank)
+
     # Create Collator and DataLoader
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
@@ -79,7 +83,7 @@ def get_bridge_dataloader(batch_size,server):
     return train_dataloader, val_dataloader
 
 
-def get_dataloader(batch_size,server,dataset,vla_path):
+def get_dataloader(batch_size,server,dataset,vla_path, world_size=None, rank=None):
     # vla_path: str = "openvla/openvla-7b"
     data_root_dir = Path(f"{server}/dataset")
     # dataset_name = "bridge_orig"
@@ -136,6 +140,10 @@ def get_dataloader(batch_size,server,dataset,vla_path):
         train=False,
         image_aug=image_aug,
     )
+
+    if world_size is not None and rank is not None and hasattr(vla_dataset_train, "shard"):
+        vla_dataset_train = vla_dataset_train.shard(num_shards=world_size, index=rank)
+        vla_dataset_val = vla_dataset_val.shard(num_shards=world_size, index=rank)
 
     # Create Collator and DataLoader
     collator = PaddedCollatorForActionPrediction(

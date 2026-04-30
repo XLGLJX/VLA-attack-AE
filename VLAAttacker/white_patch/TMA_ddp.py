@@ -14,8 +14,6 @@ import os
 import transformers
 import pickle
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.processing_prismatic import PrismaticProcessor
@@ -37,7 +35,7 @@ class OpenVLAAttacker(object):
     def __init__(self, vla_path, dataset_name, save_dir="", optimizer="adamW", resize_patch=False,
                  patch_size=[3,50,50], lr=0.01, bs=1, warmup=20, num_iter=2000,
                  maskidx=[], innerLoop=50, geometry=True, use_swanlab=True,
-                 target_action=0, accumulate_steps=1, server=""):
+                 target_action=0, accumulate_steps=1, server="", filter_grip_train_to1=False):
         # Register OpenVLA
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
@@ -53,11 +51,13 @@ class OpenVLAAttacker(object):
             trust_remote_code=True,
             local_files_only=True,
         )
-        vla.gradient_checkpointing_enable()
         self.vla = vla.eval()
-        self.vla.vision_backbone_requires_grad = True
+        for param in self.vla.parameters():
+            param.requires_grad_(False)
+        self.vla.vision_backbone_requires_grad = False
 
         # Store parameters
+        self.vla_path = vla_path
         self.dataset_name = dataset_name
         self.patch_size = patch_size
         self.lr = lr
@@ -67,10 +67,12 @@ class OpenVLAAttacker(object):
         self.maskidx = maskidx
         self.innerLoop = innerLoop
         self.geometry = geometry
-        self.use_swanlab = use_swanlab
+        self.use_swanlab = bool(use_swanlab)
         self.target_action = target_action
         self.accumulate_steps = accumulate_steps
         self.server = server
+        self.resize_patch = resize_patch
+        self.filter_grip_train_to1 = filter_grip_train_to1
 
         self.action_tokenizer = ActionTokenizer(self.processor.tokenizer)
         self.prompt_builder = PurePromptBuilder("openvla")
@@ -89,6 +91,8 @@ class OpenVLAAttacker(object):
         self.mean = [torch.tensor([0.484375, 0.455078125, 0.40625]), torch.tensor([0.5, 0.5, 0.5])]
         self.std = [torch.tensor([0.228515625, 0.2236328125, 0.224609375]), torch.tensor([0.5, 0.5, 0.5])]
         self.optimizer = optimizer
+        self.rank = int(os.environ.get("RANK", 0))
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         self.input_sizes = [[3, 224, 224], [3, 224, 224]]
         self.tvf_resize_params = [
@@ -104,6 +108,37 @@ class OpenVLAAttacker(object):
              'std': [0.228515625, 0.2236328125, 0.224609375]},
             {'inplace': False, 'mean': [0.5, 0.5, 0.5], 'std': [0.5, 0.5, 0.5]}
         ]
+
+    def is_rank_zero(self):
+        return self.rank == 0
+
+    def _create_shared_patch(self):
+        if self.is_rank_zero():
+            patch = torch.rand(self.patch_size, device=self.device)
+        else:
+            patch = torch.empty(self.patch_size, device=self.device)
+        if self.world_size > 1:
+            dist.broadcast(patch, src=0)
+        patch = torch.nn.Parameter(patch)
+        patch.requires_grad_(True)
+        patch.retain_grad()
+        return patch
+
+    def _sync_patch_grad(self, patch):
+        if patch.grad is None or self.world_size <= 1:
+            return
+        dist.all_reduce(patch.grad, op=dist.ReduceOp.SUM)
+        patch.grad.div_(self.world_size)
+
+    def _broadcast_patch(self, patch):
+        if self.world_size > 1:
+            dist.broadcast(patch.data, src=0)
+
+    def _reduce_metrics(self, metrics):
+        tensor = torch.tensor(metrics, dtype=torch.float32, device=self.device)
+        if self.world_size > 1:
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        return tensor
 
     def plot_loss(self):
         sns.set_theme()
@@ -122,17 +157,32 @@ class OpenVLAAttacker(object):
         plt.clf()
         torch.save(self.loss_buffer, '%s/loss' % (self.save_dir))
 
-    def patchattack_unconstrained(self,train_dataloader,val_dataloader,num_iter=5000,target_action=np.zeros(7),patch_size=[3,50,50],alpha=1/255, accumulate_steps=1,maskidx=[],warmup=20,filterGripTrainTo1=False,geometry=False, colorjitter=False,innerLoop=1,args=None):
+    def patchattack_unconstrained(
+        self,
+        train_dataloader,
+        val_dataloader,
+        num_iter=5000,
+        target_action=np.zeros(7),
+        patch_size=[3,50,50],
+        alpha=1 / 255,
+        accumulate_steps=1,
+        maskidx=[],
+        warmup=20,
+        filterGripTrainTo1=False,
+        geometry=False,
+        colorjitter=False,
+        innerLoop=1,
+        patch=None,
+    ):
         self.val_CE_loss = []
         self.val_L1_loss = []
         self.val_ASR = []
-        self.val_inner_relatived_distance=[]
+        self.val_inner_relatived_distance = []
         self.train_CE_loss = []
         self.train_inner_avg_loss = []
-        self.train_inner_relatived_distance=[]
-        patch = torch.rand(patch_size).to(self.device)
-        patch.requires_grad_(True)
-        patch.retain_grad()
+        self.train_inner_relatived_distance = []
+        if patch is None:
+            patch = self._create_shared_patch()
         target_action = self.base_tokenizer(self.action_tokenizer(target_action)).input_ids[2:]
         target_action.append(2)
         target_action = list(target_action)
@@ -140,23 +190,26 @@ class OpenVLAAttacker(object):
         for idx in range(len(target_action)):
             if idx not in maskidx:
                 target_action[idx] = -100
-        print(f"target_action: {target_action}")
+        if self.is_rank_zero():
+            print(f"target_action: {target_action}")
         if self.optimizer == "adamW":
             optimizer = transformers.AdamW([patch], lr=alpha)
             scheduler = transformers.get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
                 num_warmup_steps=warmup,
-                num_training_steps=int(num_iter/accumulate_steps),
+                num_training_steps=int(num_iter / accumulate_steps),
                 num_cycles=0.5,
                 last_epoch=-1,
             )
-
         train_iterator = iter(train_dataloader)
         val_iterator = iter(val_dataloader)
         for i in tqdm(range(num_iter)):
-            torch.cuda.empty_cache()
-            data = next(train_iterator)
-            if len(maskidx)==1 and maskidx[0]==6 and filterGripTrainTo1:
+            try:
+                data = next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_dataloader)
+                data = next(train_iterator)
+            if len(maskidx) == 1 and maskidx[0] == 6 and filterGripTrainTo1:
                 labels, attention_mask, input_ids, pixel_values = self.filter_train(data)
             else:
                 pixel_values = data["pixel_values"]
@@ -174,23 +227,22 @@ class OpenVLAAttacker(object):
             inner_relatived_distance = 0
             for inner_loop in range(innerLoop):
                 if not geometry and not colorjitter:
-                    modified_images = self.randomPatchTransform.paste_patch_fix(pixel_values, patch, mean=self.mean,
-                                                                                std=self.std)
+                    modified_images = self.randomPatchTransform.paste_patch_fix(
+                        pixel_values, patch, mean=self.mean, std=self.std
+                    )
                 else:
-                    modified_images = self.randomPatchTransform.apply_random_patch_batch(pixel_values, patch,
-                                                                                         mean=self.mean,
-                                                                                         std=self.std,
-                                                                                         geometry=geometry)
+                    modified_images = self.randomPatchTransform.apply_random_patch_batch(
+                        pixel_values, patch, mean=self.mean, std=self.std, geometry=geometry
+                    )
                 output: CausalLMOutputWithPast = self.vla(
-                    input_ids=input_ids.to(self.device),
-                    attention_mask=attention_mask.to(self.device),
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                     pixel_values=modified_images.to(torch.bfloat16).to(self.device),
                     labels=newlabels,
                 )
                 loss = output.loss / accumulate_steps
                 inner_avg_loss += loss.item()
-
-                action_logits = output.logits[:,self.vla.vision_backbone.featurizer.patch_embed.num_patches: -1]
+                action_logits = output.logits[:, self.vla.vision_backbone.featurizer.patch_embed.num_patches : -1]
                 action_preds = action_logits.argmax(dim=2)
                 temp_label = newlabels[:, 1:].clone()
                 mask = temp_label > self.action_tokenizer.action_token_begin_idx
@@ -200,55 +252,87 @@ class OpenVLAAttacker(object):
                 continuous_actions_pred = torch.tensor(
                     self.action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
                 )
-                inner_relatived_distance+=self.calculate_relative_distance_target(continuous_actions_pred,continuous_actions_gt)
+                inner_relatived_distance += self.calculate_relative_distance_target(
+                    continuous_actions_pred, continuous_actions_gt
+                )
                 loss.backward()
-                log_patch_grad = patch.grad.detach().mean().item()
                 if self.optimizer == "adamW":
                     if (i + 1) % accumulate_steps == 0 or (i + 1) == len(train_dataloader):
+                        self._sync_patch_grad(patch)
+                        log_patch_grad = patch.grad.detach().mean().item()
                         optimizer.step()
                         patch.data = patch.data.clamp(0, 1)
                         optimizer.zero_grad()
                         self.vla.zero_grad()
-                        torch.cuda.empty_cache()
+                        self._broadcast_patch(patch)
+                    else:
+                        log_patch_grad = patch.grad.detach().mean().item()
                 elif self.optimizer == "pgd":
                     if (i + 1) % accumulate_steps == 0 or (i + 1) == len(train_dataloader):
+                        self._sync_patch_grad(patch)
+                        log_patch_grad = patch.grad.detach().mean().item()
                         patch.data = (patch.data - alpha * patch.grad.detach().sign()).clamp(0, 1)
                         self.vla.zero_grad()
                         patch.grad.zero_()
+                        self._broadcast_patch(patch)
+                    else:
+                        log_patch_grad = patch.grad.detach().mean().item()
             inner_avg_loss /= innerLoop
-            inner_relatived_distance/=innerLoop
+            inner_relatived_distance /= innerLoop
 
             if self.optimizer == "adamW":
                 if (i + 1) % accumulate_steps == 0 or (i + 1) == len(train_dataloader):
                     scheduler.step()
 
-            self.loss_buffer.append(loss.item())
-            print(f"target_loss: {loss.item()}")
-            if args.swanlab_project != "false":
-                swanlab.log(
-                    {
-                        "TRAIN_attack_loss(CE)": loss.item(),
-                        "TRAIN_patch_gradient": log_patch_grad,
-                        "TRAIN_LR": optimizer.param_groups[0]["lr"],
-                        "TRAIN_inner_avg_loss": inner_avg_loss,
-                        "TRAIN_inner_relatived_distance": inner_relatived_distance,
-                    },
-                    step=i,
-                )
-            self.train_CE_loss.append(loss.item())
-            self.train_inner_avg_loss.append(inner_avg_loss)
-            self.train_inner_relatived_distance.append(inner_relatived_distance)
-            if i % 100 == 0:
+            train_metrics = self._reduce_metrics(
+                [loss.item(), log_patch_grad, optimizer.param_groups[0]["lr"], inner_avg_loss, inner_relatived_distance]
+            )
+            train_metrics[0] /= self.world_size
+            train_metrics[1] /= self.world_size
+            train_metrics[2] /= self.world_size
+            train_metrics[3] /= self.world_size
+            train_metrics[4] /= self.world_size
+
+            if self.is_rank_zero():
+                self.loss_buffer.append(float(train_metrics[0].item()))
+                print(f"target_loss: {train_metrics[0].item()}")
+                if self.use_swanlab:
+                    swanlab.log(
+                        {
+                            "TRAIN_attack_loss(CE)": float(train_metrics[0].item()),
+                            "TRAIN_patch_gradient": float(train_metrics[1].item()),
+                            "TRAIN_LR": float(train_metrics[2].item()),
+                            "TRAIN_inner_avg_loss": float(train_metrics[3].item()),
+                            "TRAIN_inner_relatived_distance": float(train_metrics[4].item()),
+                        },
+                        step=i,
+                    )
+                self.train_CE_loss.append(float(train_metrics[0].item()))
+                self.train_inner_avg_loss.append(float(train_metrics[3].item()))
+                self.train_inner_relatived_distance.append(float(train_metrics[4].item()))
+
+            if i % 100 == 0 and self.is_rank_zero():
                 self.plot_loss()
 
             if i % 100 == 0:
-                avg_CE_loss = 0
-                avg_L1_loss = 0
-                val_num_sample = 0
-                success_attack_num = 0
-                val_inner_relatived_distance=0
-                all_02other_success, all_gt_0_num, all_12other_success, all_gt_1_num, all_other20_success, all_gt_others_num =0,0,0,0,0,0
-                print("evaluating...")
+                avg_CE_loss_sum = 0.0
+                avg_L1_loss_sum = 0.0
+                val_num_sample = 0.0
+                success_attack_num = 0.0
+                val_inner_relatived_distance_sum = 0.0
+                all_02other_success, all_gt_0_num, all_12other_success, all_gt_1_num, all_other20_success, all_gt_others_num = (
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+                saved_continuous_actions_pred = None
+                saved_continuous_actions_gt = None
+                saved_modified_images = None
+                if self.is_rank_zero():
+                    print("evaluating...")
                 with torch.no_grad():
                     for j in tqdm(range(100)):
                         try:
@@ -256,49 +340,51 @@ class OpenVLAAttacker(object):
                         except StopIteration:
                             val_iterator = iter(val_dataloader)
                             data = next(val_iterator)
-                        torch.cuda.empty_cache()
                         pixel_values = data["pixel_values"]
                         labels = data["labels"].to(self.device)
                         attention_mask = data["attention_mask"].to(self.device)
                         input_ids = data["input_ids"].to(self.device)
 
-                        if len(maskidx)==1 and maskidx[0]==6:
+                        if len(maskidx) == 1 and maskidx[0] == 6:
                             pre_ids = self.randomPatchTransform.im_process(pixel_values, mean=self.mean, std=self.std)
                             pre_output: CausalLMOutputWithPast = self.vla(
-                                input_ids=input_ids.to(self.device),
-                                attention_mask=attention_mask.to(self.device),
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
                                 pixel_values=pre_ids.to(torch.bfloat16).to(self.device),
                                 labels=labels,
                             )
-                            pre_action_logits = pre_output.logits[:,
-                                            self.vla.vision_backbone.featurizer.patch_embed.num_patches: -1]
+                            pre_action_logits = pre_output.logits[
+                                :, self.vla.vision_backbone.featurizer.patch_embed.num_patches : -1
+                            ]
                             pre_action_preds = pre_action_logits.argmax(dim=2)
                             pre_action_gt = labels[:, 1:].to(self.device)
                             pre_mask = pre_action_gt > self.action_tokenizer.action_token_begin_idx
 
-                            formulate_pre_pred = pre_action_preds[pre_mask].view(pre_action_preds[pre_mask].shape[0] // 7,7)  # shape [2,7]
-                            formulate_pre_gt = pre_action_gt[pre_mask].view(pre_action_gt[pre_mask].shape[0] // 7,7)
+                            formulate_pre_pred = pre_action_preds[pre_mask].view(
+                                pre_action_preds[pre_mask].shape[0] // 7, 7
+                            )
+                            formulate_pre_gt = pre_action_gt[pre_mask].view(
+                                pre_action_gt[pre_mask].shape[0] // 7, 7
+                            )
                             correct_index = []
                             for del_idx in range(formulate_pre_pred.shape[0]):
-                                if formulate_pre_pred[del_idx][-1] == formulate_pre_gt[del_idx][-1]:
+                                if formulate_pre_pred[del_idx, -1] == formulate_pre_gt[del_idx, -1]:
                                     correct_index.append(del_idx)
                             if len(correct_index) == 0:
-                                print("No Correct in Val!")
                                 continue
-                            else:
-                                labels = labels[correct_index,:]
-                                attention_mask = attention_mask[correct_index,:]
-                                input_ids = input_ids[correct_index,:]
-                                pixel_values = [pixel_values[i] for i in correct_index]
-                        val_num_sample += labels.shape[0]
+                            labels = labels[correct_index, :]
+                            attention_mask = attention_mask[correct_index, :]
+                            input_ids = input_ids[correct_index, :]
+                            pixel_values = [pixel_values[k] for k in correct_index]
+                        val_num_sample += float(labels.shape[0])
                         if not geometry and not colorjitter:
-                            modified_images = self.randomPatchTransform.paste_patch_fix(pixel_values, patch, mean=self.mean,
-                                                                                        std=self.std)
+                            modified_images = self.randomPatchTransform.paste_patch_fix(
+                                pixel_values, patch, mean=self.mean, std=self.std
+                            )
                         else:
-                            modified_images = self.randomPatchTransform.apply_random_patch_batch(pixel_values, patch,
-                                                                                                 mean=self.mean,
-                                                                                                 std=self.std,
-                                                                                                 geometry=geometry)
+                            modified_images = self.randomPatchTransform.apply_random_patch_batch(
+                                pixel_values, patch, mean=self.mean, std=self.std, geometry=geometry
+                            )
                         newlabels = []
                         for k in range(labels.shape[0]):
                             temp_label = labels[k].clone()
@@ -306,8 +392,8 @@ class OpenVLAAttacker(object):
                             newlabels.append(temp_label.unsqueeze(0))
                         newlabels = torch.cat(newlabels, dim=0)
                         output: CausalLMOutputWithPast = self.vla(
-                            input_ids=input_ids.to(self.device),
-                            attention_mask=attention_mask.to(self.device),
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
                             pixel_values=modified_images.to(torch.bfloat16).to(self.device),
                             labels=newlabels,
                         )
@@ -321,15 +407,13 @@ class OpenVLAAttacker(object):
                         continuous_actions_gt = torch.tensor(
                             self.action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
                         )
-                        val_inner_relatived_distance += self.calculate_relative_distance_target(continuous_actions_pred,
-                                                                                        continuous_actions_gt)
-                        real_gt = labels[:, 1:].to(action_preds.device)
-                        real_mask = real_gt > self.action_tokenizer.action_token_begin_idx
-                        real_continuous_actions_gt = torch.tensor(
-                            self.action_tokenizer.decode_token_ids_to_actions(real_gt[real_mask].cpu().numpy())
+                        val_inner_relatived_distance_sum += float(
+                            self.calculate_relative_distance_target(continuous_actions_pred, continuous_actions_gt).item()
                         )
-                        if len(maskidx)==1 and maskidx[0]==6:
-                            temp_02other_success, gt_0_num, temp_12other_success, gt_1_num, temp_other20_success, gt_others_num = self.calculate_01_ASR(pred=action_preds[mask],gt=labels[:,1:][mask])
+                        if len(maskidx) == 1 and maskidx[0] == 6:
+                            temp_02other_success, gt_0_num, temp_12other_success, gt_1_num, temp_other20_success, gt_others_num = (
+                                self.calculate_01_ASR(pred=action_preds[mask], gt=labels[:, 1:][mask])
+                            )
                             all_02other_success += temp_02other_success
                             all_gt_0_num += gt_0_num
                             all_12other_success += temp_12other_success
@@ -337,32 +421,59 @@ class OpenVLAAttacker(object):
                             all_other20_success += temp_other20_success
                             all_gt_others_num += gt_others_num
                         action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
-                        temp_continuous_actions_pred = continuous_actions_pred.view(continuous_actions_pred.shape[0] // len(maskidx),len(maskidx))
-                        temp_continuous_actions_gt = continuous_actions_gt.view(continuous_actions_gt.shape[0] // len(maskidx),len(maskidx))
+                        temp_continuous_actions_pred = continuous_actions_pred.view(
+                            continuous_actions_pred.shape[0] // len(maskidx), len(maskidx)
+                        )
+                        temp_continuous_actions_gt = continuous_actions_gt.view(
+                            continuous_actions_gt.shape[0] // len(maskidx), len(maskidx)
+                        )
 
                         for idx in range(temp_continuous_actions_pred.shape[0]):
-                            if temp_continuous_actions_pred.ndim==2:
+                            if temp_continuous_actions_pred.ndim == 2:
                                 flag = True
                                 for idy in range(temp_continuous_actions_pred.shape[1]):
-                                    if temp_continuous_actions_pred[idx,idy]!=temp_continuous_actions_gt[idx,idy]:
+                                    if temp_continuous_actions_pred[idx, idy] != temp_continuous_actions_gt[idx, idy]:
                                         flag = False
                                 if flag:
                                     success_attack_num += 1
                             else:
-                                if continuous_actions_pred[idx]==continuous_actions_gt[idx]:
-                                    success_attack_num+=1
-                        avg_L1_loss += action_l1_loss.item()
-                        avg_CE_loss += output.loss.item()
-                    avg_L1_loss /= val_num_sample
-                    avg_CE_loss /= val_num_sample
-                    ASR = success_attack_num / val_num_sample
-                    val_inner_relatived_distance /= val_num_sample
-                    if len(maskidx)==1 and maskidx[0]==6:
-                        ASR_02other = all_02other_success / all_gt_0_num if all_gt_0_num != 0 else 0
-                        ASR_12other = all_12other_success / all_gt_1_num if all_gt_1_num != 0 else 0
-                        ASR_other20 = all_other20_success / all_gt_others_num if all_gt_others_num != 0 else 0
-                        ALL_ASR_6 = (all_02other_success + all_12other_success) / (all_gt_0_num + all_gt_1_num) if (all_gt_0_num + all_gt_1_num) != 0 else 0
-                        if args.swanlab_project != "false":
+                                if continuous_actions_pred[idx] == continuous_actions_gt[idx]:
+                                    success_attack_num += 1
+                        avg_L1_loss_sum += float(action_l1_loss.item())
+                        avg_CE_loss_sum += float(output.loss.item())
+                        saved_continuous_actions_pred = continuous_actions_pred.detach().cpu()
+                        saved_continuous_actions_gt = continuous_actions_gt.detach().cpu()
+                        saved_modified_images = modified_images[:, 0:3, :, :].detach().cpu()
+
+                reduced = self._reduce_metrics(
+                    [
+                        avg_CE_loss_sum,
+                        avg_L1_loss_sum,
+                        success_attack_num,
+                        val_num_sample,
+                        val_inner_relatived_distance_sum,
+                        all_02other_success,
+                        all_gt_0_num,
+                        all_12other_success,
+                        all_gt_1_num,
+                        all_other20_success,
+                        all_gt_others_num,
+                    ]
+                )
+                global_val_num_sample = max(float(reduced[3].item()), 1.0)
+                avg_CE_loss = float(reduced[0].item()) / global_val_num_sample
+                avg_L1_loss = float(reduced[1].item()) / global_val_num_sample
+                ASR = float(reduced[2].item()) / global_val_num_sample
+                val_inner_relatived_distance = float(reduced[4].item()) / global_val_num_sample
+
+                if self.is_rank_zero():
+                    if len(maskidx) == 1 and maskidx[0] == 6:
+                        ASR_02other = float(reduced[5].item()) / float(reduced[6].item()) if reduced[6].item() != 0 else 0.0
+                        ASR_12other = float(reduced[7].item()) / float(reduced[8].item()) if reduced[8].item() != 0 else 0.0
+                        ASR_other20 = float(reduced[9].item()) / float(reduced[10].item()) if reduced[10].item() != 0 else 0.0
+                        denom = float(reduced[6].item() + reduced[8].item())
+                        ALL_ASR_6 = float(reduced[5].item() + reduced[7].item()) / denom if denom != 0 else 0.0
+                        if self.use_swanlab:
                             swanlab.log(
                                 {
                                     "VAL_avg_CE_loss": avg_CE_loss,
@@ -371,57 +482,67 @@ class OpenVLAAttacker(object):
                                     "ASR_02other": ASR_02other,
                                     "ASR_12other": ASR_12other,
                                     "ASR_other20": ASR_other20,
-                                    "ALL_ASR_6":ALL_ASR_6,
-                                    "inner_relatived_distance":inner_relatived_distance
+                                    "ALL_ASR_6": ALL_ASR_6,
+                                    "VAL_inner_relatived_distance": val_inner_relatived_distance,
                                 },
                                 step=i,
                             )
                     else:
-                        if args.swanlab_project != "false":
+                        if self.use_swanlab:
                             swanlab.log(
                                 {
                                     "VAL_avg_CE_loss": avg_CE_loss,
                                     "VAL_avg_L1_loss": avg_L1_loss,
                                     "VAL_ASR": ASR,
-                                    "VAL_inner_relatived_distance":val_inner_relatived_distance
+                                    "VAL_inner_relatived_distance": val_inner_relatived_distance,
                                 },
                                 step=i,
                             )
 
-                    if avg_L1_loss<self.min_val_avg_L1_loss:
+                    if avg_L1_loss < self.min_val_avg_L1_loss and saved_continuous_actions_pred is not None:
                         self.min_val_avg_L1_loss = avg_L1_loss
-                        temp_save_dir = os.path.join(self.save_dir,f"{str(i)}")
-                        os.makedirs(temp_save_dir,exist_ok=True)
-                        torch.save(patch.detach().cpu(), os.path.join(temp_save_dir,"patch.pt"))
-                        val_related_file_path = os.path.join(temp_save_dir,"val_related_data")
-                        os.makedirs(val_related_file_path,exist_ok=True)
-                        torch.save(continuous_actions_pred.detach().cpu(), os.path.join(val_related_file_path,"continuous_actions_pred.pt"))
-                        torch.save(continuous_actions_gt.detach().cpu(), os.path.join(val_related_file_path,"continuous_actions_gt.pt"))
-                        modified_images = self.randomPatchTransform.denormalize(modified_images[:,0:3,:,:].detach().cpu(), mean=self.mean[0], std=self.std[0])
+                        temp_save_dir = os.path.join(self.save_dir, f"{str(i)}")
+                        os.makedirs(temp_save_dir, exist_ok=True)
+                        torch.save(patch.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
+                        val_related_file_path = os.path.join(temp_save_dir, "val_related_data")
+                        os.makedirs(val_related_file_path, exist_ok=True)
+                        torch.save(
+                            saved_continuous_actions_pred,
+                            os.path.join(val_related_file_path, "continuous_actions_pred.pt"),
+                        )
+                        torch.save(
+                            saved_continuous_actions_gt,
+                            os.path.join(val_related_file_path, "continuous_actions_gt.pt"),
+                        )
+                        modified_images = self.randomPatchTransform.denormalize(
+                            saved_modified_images, mean=self.mean[0], std=self.std[0]
+                        )
                         pil_imgs = []
                         for o in range(modified_images.shape[0]):
-                            pil_img = torchvision.transforms.ToPILImage()(modified_images[o,:,:,:])
-                            pil_img.save(os.path.join(val_related_file_path,f"{str(o)}.png"))
+                            pil_img = torchvision.transforms.ToPILImage()(modified_images[o, :, :, :])
+                            pil_img.save(os.path.join(val_related_file_path, f"{str(o)}.png"))
                             pil_imgs.append(pil_img)
-                        if args.swanlab_project != "false":
+                        if self.use_swanlab:
                             swanlab.log({"AdvImg": [swanlab.Image(pil_img) for pil_img in pil_imgs]})
                     temp_save_dir = os.path.join(self.save_dir, "last")
                     os.makedirs(temp_save_dir, exist_ok=True)
                     torch.save(patch.detach().cpu(), os.path.join(temp_save_dir, "patch.pt"))
-                    val_related_file_path = os.path.join(temp_save_dir, "val_related_data")
-                    os.makedirs(val_related_file_path, exist_ok=True)
-                    torch.save(continuous_actions_pred.detach().cpu(),
-                               os.path.join(val_related_file_path, "continuous_actions_pred.pt"))
-                    torch.save(continuous_actions_gt.detach().cpu(),
-                               os.path.join(val_related_file_path, "continuous_actions_gt.pt"))
-                    modified_images = self.randomPatchTransform.denormalize(
-                        modified_images[:, 0:3, :, :].detach().cpu(), mean=self.mean[0], std=self.std[0])
-                self.val_CE_loss.append(avg_CE_loss)
-                self.val_L1_loss.append(avg_L1_loss)
-                self.val_ASR.append(success_attack_num/val_num_sample)
-                self.val_inner_relatived_distance.append(val_inner_relatived_distance)
-                self.save_info(path=self.save_dir)
-                torch.cuda.empty_cache()
+                    if saved_continuous_actions_pred is not None:
+                        val_related_file_path = os.path.join(temp_save_dir, "val_related_data")
+                        os.makedirs(val_related_file_path, exist_ok=True)
+                        torch.save(
+                            saved_continuous_actions_pred,
+                            os.path.join(val_related_file_path, "continuous_actions_pred.pt"),
+                        )
+                        torch.save(
+                            saved_continuous_actions_gt,
+                            os.path.join(val_related_file_path, "continuous_actions_gt.pt"),
+                        )
+                    self.val_CE_loss.append(avg_CE_loss)
+                    self.val_L1_loss.append(avg_L1_loss)
+                    self.val_ASR.append(ASR)
+                    self.val_inner_relatived_distance.append(val_inner_relatived_distance)
+                    self.save_info(path=self.save_dir)
 
     def modifiy_labels(self,labels,target_action={"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8}):
         newlabels = []
@@ -522,29 +643,29 @@ class OpenVLAAttacker(object):
             temp_relative_distance = distance_to_anchor / max_boundary_distance
             relative_distance += temp_relative_distance
         return relative_distance/pred.shape[0]
-    def setup_ddp(self, rank, world_size):
-        """Setup DDP for distributed training"""
-        torch.cuda.set_device(rank)
-        self.vla = self.vla.to(rank)
-        self.vla = DDP(self.vla, device_ids=[rank], find_unused_parameters=True)
-        self.device = torch.device(f'cuda:{rank}')
-
     def attack_ddp(self, rank, world_size):
-        """Main attack method with DDP support"""
-        self.setup_ddp(rank, world_size)
-        
-        # Load data with distributed sampler
+        """Run synchronous multi-GPU attack optimization over a single shared patch."""
+        self.rank = rank
+        self.world_size = world_size
+        torch.cuda.set_device(rank)
+        self.device = torch.device(f"cuda:{rank}")
+        self.randomPatchTransform = RandomPatchTransform(self.device, self.resize_patch)
+        self.vla = self.vla.to(self.device)
+        patch = self._create_shared_patch()
+
         train_dataloader, val_dataloader = get_dataloader(
             batch_size=self.bs,
             server=self.server,
             dataset=self.dataset_name,
-            vla_path=self.server + "/models/" + self.dataset_name.split('_')[0]
+            vla_path=self.vla_path,
+            world_size=world_size,
+            rank=rank,
         )
-        
-        # Run attack
+
         target_action_array = self.target_action * np.ones(7)
         self.patchattack_unconstrained(
-            train_dataloader, val_dataloader,
+            train_dataloader,
+            val_dataloader,
             num_iter=self.num_iter,
             target_action=target_action_array,
             patch_size=self.patch_size,
@@ -552,15 +673,18 @@ class OpenVLAAttacker(object):
             accumulate_steps=self.accumulate_steps,
             maskidx=self.maskidx,
             warmup=self.warmup,
+            filterGripTrainTo1=self.filter_grip_train_to1,
             geometry=self.geometry,
-            innerLoop=self.innerLoop
+            innerLoop=self.innerLoop,
+            patch=patch,
         )
+        if self.world_size > 1:
+            dist.barrier()
 
     @staticmethod
     def _attack_entry(rank, instance_params, world_size):
-        """Static entry point for DDP"""
+        """Static entry point for synchronous distributed patch optimization."""
         if not dist.is_initialized():
             dist.init_process_group("nccl", rank=rank, world_size=world_size)
-        
         instance = OpenVLAAttacker(**instance_params)
         instance.attack_ddp(rank, world_size)

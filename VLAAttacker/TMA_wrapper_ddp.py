@@ -84,10 +84,11 @@ def main(args):
         "maskidx": args.maskidx,
         "innerLoop": args.innerLoop,
         "geometry": args.geometry,
-        "use_swanlab": True,
+        "use_swanlab": args.swanlab_project != "false",
         "target_action": args.targetAction,
         "accumulate_steps": args.accumulate,
-        "server": pwd
+        "server": pwd,
+        "filter_grip_train_to1": args.filterGripTrainTo1,
     }
 
     OpenVLAAttacker._attack_entry(rank, instance_params, world_size)
