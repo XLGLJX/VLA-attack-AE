@@ -47,6 +47,7 @@ from experiments.robot.libero.libero_utils import (  # noqa: E402
     quat2axisangle,
     save_rollout_video,
 )
+from experiments.robot.libero import libero_mesh_viser as mesh_viser  # noqa: E402
 from experiments.robot.libero.run_libero_eval_viser_3d import (  # noqa: E402
     aabb_to_segments,
     env_image_for_viser,
@@ -618,13 +619,6 @@ class GenerateConfig:
 
 @draccus.wrap()
 def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
-    try:
-        import viser
-    except ImportError as exc:
-        raise ImportError(
-            "`viser` is required for run_libero_eval_viser_mesh.py. Install it with `pip install viser`."
-        ) from exc
-
     assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
     if "image_aug" in str(cfg.pretrained_checkpoint):
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
@@ -655,108 +649,7 @@ def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
         run_id,
         vars(cfg),
     )
-
-    server = viser.ViserServer(host=cfg.host, port=cfg.port)
-    server.gui.configure_theme(control_layout="collapsible", control_width=cfg.control_width, show_share_button=False)
-    server.gui.set_panel_label("OpenVLA LIBERO Mesh Monitor")
-    server.scene.world_axes.visible = True
-
-    blank_frame = np.zeros((cfg.resolution, cfg.resolution, 3), dtype=np.uint8)
-    with server.gui.add_folder("Frames"):
-        env_image_handle = server.gui.add_image(
-            blank_frame,
-            label="Environment Frame",
-            format="jpeg",
-            jpeg_quality=cfg.jpeg_quality,
-            visible=cfg.stream_env_frame,
-        )
-        model_image_handle = server.gui.add_image(
-            blank_frame,
-            label="Model Input Frame",
-            format="jpeg",
-            jpeg_quality=cfg.jpeg_quality,
-            visible=cfg.stream_model_input,
-        )
-        stream_env_frame_checkbox = server.gui.add_checkbox(
-            "Stream Environment Frame", initial_value=cfg.stream_env_frame
-        )
-        stream_model_input_checkbox = server.gui.add_checkbox(
-            "Stream Model Input Frame", initial_value=cfg.stream_model_input
-        )
-
-    with server.gui.add_folder("Controls"):
-        pause_checkbox = server.gui.add_checkbox("Pause", initial_value=False)
-        stop_button = server.gui.add_button("Stop After Episode", color="red")
-        show_robot_mesh_checkbox = server.gui.add_checkbox("Show Robot Mesh", initial_value=cfg.show_robot_mesh)
-        show_object_mesh_checkbox = server.gui.add_checkbox("Show Object Mesh", initial_value=cfg.show_object_mesh)
-        show_fixture_mesh_checkbox = server.gui.add_checkbox("Show Fixture Mesh", initial_value=cfg.show_fixture_mesh)
-        show_scene_mesh_checkbox = server.gui.add_checkbox("Show Scene Mesh", initial_value=cfg.show_scene_mesh)
-        show_labels_checkbox = server.gui.add_checkbox("Show Labels", initial_value=cfg.show_labels)
-        show_interest_links_checkbox = server.gui.add_checkbox(
-            "Show Interest Links", initial_value=cfg.show_interest_links
-        )
-        show_eef_trail_checkbox = server.gui.add_checkbox("Show EEF Trail", initial_value=cfg.show_eef_trail)
-        show_workspace_box_checkbox = server.gui.add_checkbox("Show Workspace Box", initial_value=cfg.show_workspace_box)
-        focus_workspace_button = server.gui.add_button("Focus Workspace", color="blue")
-
-    with server.gui.add_folder("Status"):
-        run_status_html = server.gui.add_html("<div>Waiting for the first mesh scene...</div>")
-        action_status_html = server.gui.add_html(html_rows([("Last Action", "Waiting for the first action...")]))
-        robot_status_html = server.gui.add_html(html_rows([("Robot State", "Waiting for the first observation...")]))
-        io_status_html = server.gui.add_html(format_io_status_html(local_log_filepath, cfg.save_rollout))
-        access_markdown = server.gui.add_markdown(
-            "\n".join(
-                [
-                    f"**Bind Host**: {cfg.host}",
-                    f"**Bind Port**: {cfg.port}",
-                    "**SSH Port Forward**: `ssh -L {port}:localhost:{port} <user>@<server>`".replace(
-                        "{port}", str(cfg.port)
-                    ),
-                    f"**Browser URL**: `http://localhost:{cfg.port}`",
-                    f"**Mesh Groups**: `{cfg.mesh_geom_groups}`",
-                    "**Note**: This mesh view renders geometry and simple material colors, not texture maps.",
-                ]
-            )
-        )
-
-    camera_focus_state = {
-        "look_at": np.array([0.35, 0.0, 0.20], dtype=np.float64),
-        "offset": np.array([0.9, -1.05, 0.9], dtype=np.float64),
-        "up": np.array([0.0, 0.0, 1.0], dtype=np.float64),
-    }
-    server.initial_camera.position = tuple(camera_focus_state["look_at"] + camera_focus_state["offset"])
-    server.initial_camera.look_at = tuple(camera_focus_state["look_at"])
-    server.initial_camera.up_direction = tuple(camera_focus_state["up"])
-
-    def apply_camera_focus(camera: Any) -> None:
-        # 必须先设 position 和 up，最后设 look_at
-        # 因为 look_at 的旋转计算依赖当前 position 和 up
-        camera.position = tuple(camera_focus_state["look_at"] + camera_focus_state["offset"])
-        camera.up_direction = tuple(camera_focus_state["up"])
-        camera.look_at = tuple(camera_focus_state["look_at"])
-
-    def apply_camera_focus_to_all_clients() -> None:
-        get_clients = getattr(server, "get_clients", None)
-        if not callable(get_clients):
-            return
-        try:
-            clients = get_clients()
-        except Exception:
-            return
-        client_iter = clients.values() if isinstance(clients, dict) else clients
-        for client in client_iter:
-            camera = getattr(client, "camera", None)
-            if camera is not None:
-                apply_camera_focus(camera)
-
-    @server.on_client_connect
-    def _(client) -> None:
-        apply_camera_focus(client.camera)
-
-    @focus_workspace_button.on_click
-    def _(_) -> None:
-        apply_camera_focus_to_all_clients()
-
+    runtime = mesh_viser.create_mesh_viser_runtime(cfg, local_log_filepath)
     print(f"Viser mesh server listening on http://{cfg.host}:{cfg.port}")
     log_file.write(f"Viser mesh server listening on http://{cfg.host}:{cfg.port}\n")
     log_file.flush()
@@ -775,11 +668,10 @@ def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
 
     resize_size = get_image_resize_size(cfg)
     max_steps = get_max_steps(cfg.task_suite_name)
-    geom_groups = parse_geom_groups(cfg.mesh_geom_groups)
+    geom_groups = mesh_viser.parse_geom_groups(cfg.mesh_geom_groups)
 
     total_episodes, total_successes = 0, 0
     stop_requested = False
-    mesh_scene_handles: Optional[MeshSceneHandles] = None
 
     for task_id in tqdm.tqdm(task_ids):
         task = task_suite.get_task(task_id)
@@ -801,72 +693,44 @@ def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
                 eef_trail_points.clear()
 
                 if cfg.auto_focus_workspace:
-                    focus_target = get_workspace_focus_point(None, fallback=camera_focus_state["look_at"])
-                    workspace = get_workspace_box(get_domain_env(env))
-                    if workspace is not None:
-                        lower, upper = workspace
-                        focus_target = (np.asarray(lower) + np.asarray(upper)) / 2.0
-                        focus_target[2] = float(np.asarray(upper)[2]) + cfg.camera_focus_height_offset
-                    camera_focus_state["look_at"] = focus_target
-                    server.initial_camera.position = tuple(camera_focus_state["look_at"] + camera_focus_state["offset"])
-                    server.initial_camera.up_direction = tuple(camera_focus_state["up"])
-                    server.initial_camera.look_at = tuple(camera_focus_state["look_at"])
-                    apply_camera_focus_to_all_clients()
+                    mesh_viser.auto_focus_workspace(runtime, env, cfg)
                     cfg.auto_focus_workspace = False
 
-                if mesh_scene_handles is None:
-                    mesh_scene_handles = add_mesh_scene(server, env, mesh_states, label_states, cfg)
-                update_mesh_scene(mesh_scene_handles, mesh_states)
-                update_mesh_overlays(
-                    mesh_scene_handles, env, obs, label_states, eef_trail_points, cfg.trail_visible_points
-                )
-                apply_mesh_visibility(
-                    mesh_scene_handles,
-                    show_robot_mesh=show_robot_mesh_checkbox.value,
-                    show_object_mesh=show_object_mesh_checkbox.value,
-                    show_fixture_mesh=show_fixture_mesh_checkbox.value,
-                    show_scene_mesh=show_scene_mesh_checkbox.value,
-                    show_labels=show_labels_checkbox.value,
-                    show_interest_links=show_interest_links_checkbox.value,
-                    show_eef_trail=show_eef_trail_checkbox.value,
-                    show_workspace_box=show_workspace_box_checkbox.value,
-                )
+                mesh_viser.sync_mesh_scene(runtime, env, obs, mesh_states, label_states, eef_trail_points, cfg)
 
                 model_frame = get_libero_image(obs, resize_size)
-                if stream_env_frame_checkbox.value:
-                    env_image_handle.image = env_image_for_viser(obs)
-                if stream_model_input_checkbox.value:
-                    model_image_handle.image = model_frame
+                mesh_viser.update_stream_images(runtime, obs, model_frame)
 
                 t = 0
                 done = False
                 replay_images = []
                 last_action = None
 
-                run_status_html.content = format_run_status_html(
-                    task_description,
-                    task_id,
-                    episode_idx,
-                    t,
-                    done,
-                    total_episodes,
-                    total_successes,
-                    len(mesh_states),
+                mesh_viser.update_status(
+                    runtime,
+                    task_description=task_description,
+                    task_id=task_id,
+                    episode_idx=episode_idx,
+                    step_idx=t,
+                    done=done,
+                    total_episodes=total_episodes,
+                    total_successes=total_successes,
+                    mesh_count=len(mesh_states),
+                    obs=obs,
+                    action=last_action,
                 )
-                action_status_html.content = html_rows([("Last Action", format_action(last_action))])
-                robot_status_html.content = format_robot_status_html(obs, last_action)
                 print(f"Starting episode {task_episodes + 1}...")
                 log_file.write(f"Starting episode {task_episodes + 1}...\n")
 
                 while t < max_steps + cfg.num_steps_wait:
-                    if stop_button.value:
-                        stop_button.value = False
+                    if runtime.controls.stop_button.value:
+                        runtime.controls.stop_button.value = False
                         stop_requested = True
 
-                    while pause_checkbox.value and not stop_requested:
+                    while runtime.controls.pause_checkbox.value and not stop_requested:
                         time.sleep(0.1)
-                        if stop_button.value:
-                            stop_button.value = False
+                        if runtime.controls.stop_button.value:
+                            runtime.controls.stop_button.value = False
                             stop_requested = True
                             break
                     if stop_requested:
@@ -877,39 +741,23 @@ def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
                             obs, _, done, _ = env.step(get_libero_dummy_action(cfg.model_family))
                             mesh_states = extract_mesh_states(env, geom_groups)
                             label_states = extract_entity_label_states(env, cfg.label_offset)
-                            update_mesh_scene(mesh_scene_handles, mesh_states)
-                            update_mesh_overlays(
-                                mesh_scene_handles, env, obs, label_states, eef_trail_points, cfg.trail_visible_points
-                            )
-                            apply_mesh_visibility(
-                                mesh_scene_handles,
-                                show_robot_mesh=show_robot_mesh_checkbox.value,
-                                show_object_mesh=show_object_mesh_checkbox.value,
-                                show_fixture_mesh=show_fixture_mesh_checkbox.value,
-                                show_scene_mesh=show_scene_mesh_checkbox.value,
-                                show_labels=show_labels_checkbox.value,
-                                show_interest_links=show_interest_links_checkbox.value,
-                                show_eef_trail=show_eef_trail_checkbox.value,
-                                show_workspace_box=show_workspace_box_checkbox.value,
-                            )
+                            mesh_viser.sync_mesh_scene(runtime, env, obs, mesh_states, label_states, eef_trail_points, cfg)
                             model_frame = get_libero_image(obs, resize_size)
-                            if stream_env_frame_checkbox.value:
-                                env_image_handle.image = env_image_for_viser(obs)
-                            if stream_model_input_checkbox.value:
-                                model_image_handle.image = model_frame
+                            mesh_viser.update_stream_images(runtime, obs, model_frame)
                             t += 1
-                            run_status_html.content = format_run_status_html(
-                                task_description,
-                                task_id,
-                                episode_idx,
-                                t,
-                                done,
-                                total_episodes,
-                                total_successes,
-                                len(mesh_states),
+                            mesh_viser.update_status(
+                                runtime,
+                                task_description=task_description,
+                                task_id=task_id,
+                                episode_idx=episode_idx,
+                                step_idx=t,
+                                done=done,
+                                total_episodes=total_episodes,
+                                total_successes=total_successes,
+                                mesh_count=len(mesh_states),
+                                obs=obs,
+                                action=last_action,
                             )
-                            action_status_html.content = html_rows([("Last Action", format_action(last_action))])
-                            robot_status_html.content = format_robot_status_html(obs, last_action)
                             continue
 
                         model_frame = get_libero_image(obs, resize_size)
@@ -939,39 +787,23 @@ def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
                         obs, _, done, _ = env.step(action.tolist())
                         mesh_states = extract_mesh_states(env, geom_groups)
                         label_states = extract_entity_label_states(env, cfg.label_offset)
-                        update_mesh_scene(mesh_scene_handles, mesh_states)
-                        update_mesh_overlays(
-                            mesh_scene_handles, env, obs, label_states, eef_trail_points, cfg.trail_visible_points
-                        )
-                        apply_mesh_visibility(
-                            mesh_scene_handles,
-                            show_robot_mesh=show_robot_mesh_checkbox.value,
-                            show_object_mesh=show_object_mesh_checkbox.value,
-                            show_fixture_mesh=show_fixture_mesh_checkbox.value,
-                            show_scene_mesh=show_scene_mesh_checkbox.value,
-                            show_labels=show_labels_checkbox.value,
-                            show_interest_links=show_interest_links_checkbox.value,
-                            show_eef_trail=show_eef_trail_checkbox.value,
-                            show_workspace_box=show_workspace_box_checkbox.value,
-                        )
-                        if stream_env_frame_checkbox.value:
-                            env_image_handle.image = env_image_for_viser(obs)
-                        if stream_model_input_checkbox.value:
-                            model_image_handle.image = model_frame
+                        mesh_viser.sync_mesh_scene(runtime, env, obs, mesh_states, label_states, eef_trail_points, cfg)
+                        mesh_viser.update_stream_images(runtime, obs, model_frame)
                         t += 1
 
-                        run_status_html.content = format_run_status_html(
-                            task_description,
-                            task_id,
-                            episode_idx,
-                            t,
-                            done,
-                            total_episodes,
-                            total_successes,
-                            len(mesh_states),
+                        mesh_viser.update_status(
+                            runtime,
+                            task_description=task_description,
+                            task_id=task_id,
+                            episode_idx=episode_idx,
+                            step_idx=t,
+                            done=done,
+                            total_episodes=total_episodes,
+                            total_successes=total_successes,
+                            mesh_count=len(mesh_states),
+                            obs=obs,
+                            action=last_action,
                         )
-                        action_status_html.content = html_rows([("Last Action", format_action(last_action))])
-                        robot_status_html.content = format_robot_status_html(obs, last_action)
                         if done:
                             task_successes += 1
                             total_successes += 1
@@ -1023,9 +855,7 @@ def eval_libero_viser_mesh(cfg: GenerateConfig) -> None:
         if stop_requested:
             break
 
-        if mesh_scene_handles is not None:
-            mesh_scene_handles.root.remove()
-            mesh_scene_handles = None
+        mesh_viser.clear_mesh_scene(runtime)
 
     maybe_log_swanlab(
         swanlab_enabled,
