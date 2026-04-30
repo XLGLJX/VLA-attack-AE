@@ -152,7 +152,6 @@ data/
 /run/
 /experiments/logs/
 /.codex
-/AI_log/
 /LIBERO/
 
 # Rollout videos and wandb logs
