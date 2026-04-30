@@ -37,10 +37,10 @@ def set_seed_everywhere(seed: int):
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 
-def get_model(cfg, wrap_diffusion_policy_for_droid=False):
+def get_model(cfg, wrap_diffusion_policy_for_droid=False, device=None):
     """Load model for evaluation."""
     if cfg.model_family == "openvla":
-        model = get_vla(cfg)
+        model = get_vla(cfg, device=device)
     else:
         raise ValueError("Unexpected `model_family` found in config.")
     print(f"Loaded model: {type(model)}")
@@ -60,11 +60,18 @@ def get_image_resize_size(cfg):
     return resize_size
 
 
-def get_action(cfg, model, obs, task_label, processor=None):
+def get_action(cfg, model, obs, task_label, processor=None, device=None):
     """Queries the model to get an action."""
     if cfg.model_family == "openvla":
         action = get_vla_action(
-            model, processor, cfg.pretrained_checkpoint, obs, task_label, cfg.unnorm_key, center_crop=cfg.center_crop
+            model,
+            processor,
+            cfg.pretrained_checkpoint,
+            obs,
+            task_label,
+            cfg.unnorm_key,
+            center_crop=cfg.center_crop,
+            device=device,
         )
         assert action.shape == (ACTION_DIM,)
     else:

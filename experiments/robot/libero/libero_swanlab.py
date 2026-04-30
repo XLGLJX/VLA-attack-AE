@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 from pyecharts import options as pyopts
@@ -14,6 +14,107 @@ def _require_swanlab() -> Any:
     if swanlab is None:
         raise ImportError("SwanLab helpers were requested, but `swanlab` is not installed.")
     return swanlab
+
+
+def _coerce_numeric_metric(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    return None
+
+
+def _resolve_metric_keys(
+    episode_metric_history: Mapping[int, Sequence[Mapping[str, Any]]],
+    metric_keys: Optional[Sequence[str]] = None,
+) -> list[str]:
+    if metric_keys is not None:
+        return list(metric_keys)
+
+    discovered: list[str] = []
+    for metric_steps in episode_metric_history.values():
+        for metric_point in metric_steps:
+            for key, value in metric_point.items():
+                if _coerce_numeric_metric(value) is None or key in discovered:
+                    continue
+                discovered.append(key)
+    return discovered
+
+
+def build_multi_episode_metric_line_chart(
+    task_description: str,
+    metric_name: str,
+    episode_metric_series: Mapping[int, Sequence[Optional[float]]],
+    episode_done: Optional[Mapping[int, bool]] = None,
+    *,
+    x_axis_name: str = "Step",
+    y_axis_name: Optional[str] = None,
+) -> Any:
+    swanlab_module = _require_swanlab()
+    line = swanlab_module.echarts.Line()
+    max_length = max((len(series) for series in episode_metric_series.values()), default=0)
+    x_axis = list(range(max_length))
+    line.add_xaxis(x_axis)
+
+    for episode_idx, series in sorted(episode_metric_series.items()):
+        status = ""
+        if episode_done is not None and episode_idx in episode_done:
+            status = " | success" if episode_done[episode_idx] else " | fail"
+        padded = list(series) + [None] * (max_length - len(series))
+        line.add_yaxis(f"Episode {episode_idx}{status}", padded, is_symbol_show=False, is_connect_nones=False)
+
+    line.set_global_opts(
+        title_opts=pyopts.TitleOpts(title=f"{task_description} | {metric_name}"),
+        legend_opts=pyopts.LegendOpts(is_show=True),
+        tooltip_opts=pyopts.TooltipOpts(trigger="axis"),
+        xaxis_opts=pyopts.AxisOpts(type_="value", name=x_axis_name),
+        yaxis_opts=pyopts.AxisOpts(type_="value", name=y_axis_name or metric_name),
+        datazoom_opts=[pyopts.DataZoomOpts(type_="inside"), pyopts.DataZoomOpts(type_="slider")],
+    )
+    return line
+
+
+def log_multi_episode_metric_curves(
+    enabled: bool,
+    task_description: str,
+    episode_metric_history: Mapping[int, Sequence[Mapping[str, Any]]],
+    episode_done: Optional[Mapping[int, bool]] = None,
+    *,
+    metric_keys: Optional[Sequence[str]] = None,
+    log_prefix: str = "episode_metric_curves",
+    step: Optional[int] = None,
+) -> list[str]:
+    if not enabled or not episode_metric_history:
+        return []
+
+    resolved_metric_keys = _resolve_metric_keys(episode_metric_history, metric_keys)
+    if not resolved_metric_keys:
+        return []
+
+    charts: dict[str, Any] = {}
+    logged_metric_keys: list[str] = []
+    for metric_key in resolved_metric_keys:
+        series_by_episode: dict[int, list[Optional[float]]] = {}
+        for episode_idx, metric_steps in episode_metric_history.items():
+            series = [_coerce_numeric_metric(metric_point.get(metric_key)) for metric_point in metric_steps]
+            if not any(value is not None for value in series):
+                continue
+            series_by_episode[episode_idx] = series
+
+        if not series_by_episode:
+            continue
+
+        chart = build_multi_episode_metric_line_chart(
+            task_description,
+            metric_key,
+            series_by_episode,
+            episode_done,
+        )
+        charts[f"{log_prefix}/{task_description}/{metric_key}"] = chart
+        logged_metric_keys.append(metric_key)
+
+    maybe_log_swanlab(enabled, charts, step=step)
+    return logged_metric_keys
 
 
 def eef_trajectory_to_object3d(trajectory: list, episode_idx: int, done: bool) -> Any:

@@ -30,13 +30,12 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import draccus
 import numpy as np
 import tqdm
 from libero.libero import benchmark
-from pyecharts import options as pyopts
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
@@ -60,101 +59,6 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 from experiments.robot.swanlab_utils import maybe_init_swanlab, maybe_log_swanlab
-import swanlab
-
-
-def eef_trajectory_to_object3d(trajectory: list, episode_idx: int, done: bool) -> swanlab.Object3D:
-    """将 EEF xyz 轨迹转为 SwanLab Object3D 点云，整条轨迹使用统一颜色。"""
-    traj = np.stack(trajectory, axis=0)  # (T, 3)
-    T = len(traj)
-    # 统一颜色：成功用绿色，失败用红色
-    color = [50, 205, 50] if done else [220, 20, 60]
-    colors = np.tile(np.array(color, dtype=np.uint8), (T, 1))
-    points_xyzrgb = np.concatenate([traj, colors], axis=1)
-    status = "success" if done else "fail"
-    return swanlab.Object3D(
-        points_xyzrgb,
-        caption=f"Episode {episode_idx} | {status} | Steps {T}",
-    )
-
-
-def eef_trajectory_to_line3d(trajectory: list, episode_idx: int, done: bool):
-    """将 EEF xyz 轨迹转为 swanlab.echarts.Line3D 3D 折线图，颜色从轨迹起点到终点渐变。"""
-    T = len(trajectory)
-    # data: [y, x, z, normalized_time]，通过 encode 显式映射
-    # 确保 ECharts X 轴 = MuJoCo X (左右)，Y 轴 = MuJoCo Y (前后)
-    data = [
-        [float(p[1]), float(p[0]), float(p[2]), i / max(T - 1, 1)]
-        for i, p in enumerate(trajectory)
-    ]
-    status = "success" if done else "fail"
-    ec = swanlab.echarts
-
-    line3d = ec.Line3D()
-    line3d.add(
-        "",
-        data,
-        encode={"x": 1, "y": 0, "z": 2},
-        xaxis3d_opts=pyopts.Axis3DOpts(name="Y (Front/Back)", type_="value"),
-        yaxis3d_opts=pyopts.Axis3DOpts(name="X (Left/Right)", type_="value"),
-        zaxis3d_opts=pyopts.Axis3DOpts(name="Z (Up/Down)", type_="value"),
-        grid3d_opts=pyopts.Grid3DOpts(width=100, height=100, depth=100),
-        label_opts={"is_show": False},
-    )
-
-    # 颜色从起点到终点渐变: 深蓝 -> 青 -> 黄 -> 红
-    range_color = ["#313695", "#4575b4", "#74add1", "#abd9e9",
-                   "#e0f3f8", "#fee090", "#fdae61", "#f46d43", "#d73027"]
-    line3d.set_global_opts(
-        visualmap_opts=pyopts.VisualMapOpts(
-            min_=0,
-            max_=1,
-            dimension=3,
-            range_color=range_color,
-            is_show=False,
-        ),
-        title_opts=pyopts.TitleOpts(title=f"Episode {episode_idx} | {status}"),
-    )
-    # 加粗线宽
-    opts = line3d.get_options()
-    opts["series"][0]["lineStyle"] = {"width": 12}
-    return line3d
-
-
-def create_multi_episode_line3d() -> Any:
-    """创建一个空的 Line3D 对象，用于后续追加多条轨迹系列，并开启图例。"""
-    ec = swanlab.echarts
-    line3d = ec.Line3D()
-    line3d.set_global_opts(
-        legend_opts=pyopts.LegendOpts(is_show=True),
-        title_opts=pyopts.TitleOpts(title="Multi-Episode Trajectories"),
-    )
-    return line3d
-
-
-def add_episode_to_line3d(
-    line3d: Any, trajectory: list, episode_idx: int, done: bool
-) -> Any:
-    """向已有的 Line3D 中追加一条新轨迹 series，成功为绿色，失败为红色。"""
-    data = [[float(p[1]), float(p[0]), float(p[2])] for p in trajectory]
-    status = "success" if done else "fail"
-    color = "#32CD32" if done else "#DC143C"
-
-    line3d.add(
-        f"Episode {episode_idx} | {status}",
-        data,
-        encode={"x": 1, "y": 0, "z": 2},
-        xaxis3d_opts=pyopts.Axis3DOpts(name="Y (Front/Back)", type_="value"),
-        yaxis3d_opts=pyopts.Axis3DOpts(name="X (Left/Right)", type_="value"),
-        zaxis3d_opts=pyopts.Axis3DOpts(name="Z (Up/Down)", type_="value"),
-        grid3d_opts=pyopts.Grid3DOpts(width=100, height=100, depth=100),
-        label_opts={"is_show": False},
-    )
-
-    # 手动注入 lineStyle 颜色到刚添加的 series
-    opts = line3d.get_options()
-    opts["series"][-1]["lineStyle"] = {"color": color, "width": 12}
-    return line3d
 
 
 @dataclass
